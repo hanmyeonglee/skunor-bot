@@ -14,6 +14,7 @@ import {
   createCodexCliEnvironment,
   createCodexClient,
   createThreadOptions,
+  describeCodexError,
 } from "./codex.js";
 
 process.umask(0o077);
@@ -276,6 +277,7 @@ async function handleLoginCommand(interaction) {
         log("codex_login_failed", {
           category: error.kind || "login_failed",
           ...(Number.isInteger(error.exitCode) ? { exitCode: error.exitCode } : {}),
+          diagnostic: describeCodexError(error),
         });
         await updateLoginInteraction(interaction, formatLoginFailure(rawOutput, error));
       }
@@ -332,7 +334,11 @@ async function processRequest({ sourceMessage, placeholder, question, conversati
         await saveReply(conversationKey, sourceMessage, placeholder, config.exceedMessage);
       } else {
         await saveReply(conversationKey, sourceMessage, placeholder, USER_ERROR_TEXT);
-        log("quota_recheck_failed", { category: errorKind });
+        log("quota_recheck_failed", {
+          category: errorKind,
+          messageId: sourceMessage.id,
+          diagnostic: describeCodexError(error),
+        });
       }
     }
     return;
@@ -345,26 +351,33 @@ async function processRequest({ sourceMessage, placeholder, question, conversati
   }
 
   let thread = null;
+  let currentPrompt = "";
+  let failureStage = "conversation_load";
   try {
     const conversation = database.getConversation(conversationKey);
+    failureStage = "memory_lookup";
     const memory = database.findRelevantMemory(guildId, question, MEMORY_LIMIT);
+    failureStage = conversation.codex_thread_id ? "thread_resume" : "thread_start";
     thread = conversation.codex_thread_id
       ? codex.resumeThread(conversation.codex_thread_id, codexThreadOptions)
       : codex.startThread(codexThreadOptions);
 
-    const prompt = buildCodexPrompt({
+    currentPrompt = buildCodexPrompt({
       question,
       history: conversation.codex_thread_id
         ? []
         : database.getRecentHistory(conversationKey, sourceMessage.id, THREAD_HISTORY_LIMIT),
       memory,
     });
-    const turn = await thread.run(prompt);
+    failureStage = "thread_run";
+    const turn = await thread.run(currentPrompt);
 
     const answer = boundAnswer(turn.finalResponse?.trim() || "요청을 처리했지만 답변 텍스트가 비어 있습니다.");
 
+    failureStage = "database_save";
     database.setCodexThreadId(conversationKey, thread.id);
     database.saveResearchMemory({ guildId, conversationKey, question, answer });
+    failureStage = "discord_reply";
     await saveReply(conversationKey, sourceMessage, placeholder, answer);
     log("request_completed", { channelId: sourceMessage.channelId });
   } catch (error) {
@@ -381,15 +394,18 @@ async function processRequest({ sourceMessage, placeholder, question, conversati
       return;
     }
 
+    let failureError = error;
+    let failureKind = errorKind;
     if (errorKind === "thread_missing" && thread) {
+      failureStage = "thread_restore_retry";
       try {
         const replacementThread = codex.startThread(codexThreadOptions);
-        const prompt = buildCodexPrompt({
+        currentPrompt = buildCodexPrompt({
           question,
           history: database.getRecentHistory(conversationKey, sourceMessage.id, THREAD_HISTORY_LIMIT),
           memory: database.findRelevantMemory(guildId, question, MEMORY_LIMIT),
         });
-        const turn = await replacementThread.run(prompt);
+        const turn = await replacementThread.run(currentPrompt);
         const answer = boundAnswer(turn.finalResponse?.trim() || "요청을 처리했지만 답변 텍스트가 비어 있습니다.");
         database.setCodexThreadId(conversationKey, replacementThread.id);
         database.saveResearchMemory({ guildId, conversationKey, question, answer });
@@ -409,11 +425,19 @@ async function processRequest({ sourceMessage, placeholder, question, conversati
           log("usage_limit_reached");
           return;
         }
+        failureError = retryError;
+        failureKind = retryErrorKind;
       }
     }
 
     await saveReply(conversationKey, sourceMessage, placeholder, USER_ERROR_TEXT);
-    log("request_failed", { category: errorKind, channelId: sourceMessage.channelId });
+    log("request_failed", {
+      category: failureKind,
+      stage: failureStage,
+      messageId: sourceMessage.id,
+      channelId: sourceMessage.channelId,
+      diagnostic: describeCodexError(failureError, { redactValues: [question, currentPrompt] }),
+    });
   }
 }
 
@@ -522,13 +546,17 @@ async function main() {
     }
   });
   client.on("messageCreate", (message) => {
-    void handleMessage(message).catch(() => {
-      log("message_handler_failed", { messageId: message.id, channelId: message.channelId });
+    void handleMessage(message).catch((error) => {
+      log("message_handler_failed", {
+        messageId: message.id,
+        channelId: message.channelId,
+        diagnostic: describeCodexError(error),
+      });
     });
   });
   client.on("interactionCreate", (interaction) => {
-    void handleLoginCommand(interaction).catch(() => {
-      log("login_interaction_failed");
+    void handleLoginCommand(interaction).catch((error) => {
+      log("login_interaction_failed", { diagnostic: describeCodexError(error) });
     });
   });
 
@@ -557,8 +585,8 @@ async function main() {
   await client.login(config.discordToken);
 }
 
-void main().catch(() => {
-  log("startup_failed");
+void main().catch((error) => {
+  log("startup_failed", { diagnostic: describeCodexError(error) });
   client.destroy();
   database.close();
   healthServer?.close();

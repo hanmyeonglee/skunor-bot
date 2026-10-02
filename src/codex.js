@@ -115,24 +115,63 @@ export function createThreadOptions() {
   };
 }
 
-export function classifyCodexError(error) {
+function getCodexErrorDetails(error) {
   const details = [];
+  const seen = new Set();
   let current = error;
-  for (let depth = 0; current && depth < 4; depth += 1) {
+  for (let depth = 0; current && depth < 5; depth += 1) {
     if (typeof current === "string") {
-      details.push(current);
+      details.push(["message", current]);
       break;
     }
-    if (typeof current !== "object") break;
+    if ((typeof current !== "object" && typeof current !== "function") || seen.has(current)) break;
+    seen.add(current);
 
-    for (const key of ["code", "message", "stderr", "status", "statusCode"]) {
+    if (typeof current.name === "string") details.push(["name", current.name]);
+    for (const key of ["code", "message", "stderr", "status", "statusCode", "exitCode", "type"]) {
       const value = current[key];
-      if (typeof value === "string" || typeof value === "number") details.push(String(value));
+      if (typeof value === "string" || typeof value === "number") details.push([key, String(value)]);
     }
-    current = current.cause ?? current.error ?? current.body?.error ?? null;
+    current = current.cause ?? current.error ?? current.body?.error ?? current.body?.message ?? null;
   }
+  return details;
+}
 
-  const detail = details.join(" ").toLowerCase();
+function redactCodexErrorDetail(value) {
+  return value
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [redacted]")
+    .replace(/\b(?:sk-[A-Za-z0-9_-]{12,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b/g, "[redacted]")
+    .replace(/\b(access_token|refresh_token|id_token|client_secret|api_key|authorization|password|device_code|user_code)\b(\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi, "$1$2[redacted]")
+    .replace(/\b[A-Z0-9]{4}-[A-Z0-9]{4}\b/g, "[redacted-code]")
+    .replace(/https?:\/\/[^\s<>"']+/gi, (rawUrl) => {
+      try {
+        const url = new URL(rawUrl);
+        return `${url.origin}${url.pathname}${url.search || url.hash ? "?[redacted]" : ""}`;
+      } catch {
+        return "[redacted-url]";
+      }
+    });
+}
+
+export function describeCodexError(error, { redactValues = [] } = {}) {
+  const details = getCodexErrorDetails(error)
+    .map(([key, value]) => {
+      let detail = redactCodexErrorDetail(value);
+      for (const sensitiveValue of redactValues) {
+        if (typeof sensitiveValue === "string" && sensitiveValue.length >= 8) {
+          detail = detail.replaceAll(sensitiveValue, "[redacted-request-content]");
+        }
+      }
+      return `${key}=${detail}`;
+    });
+  const diagnostic = details.join(" <- ") || "unknown error";
+  return diagnostic.length > 2_000 ? `${diagnostic.slice(0, 2_000)}…(잘림)` : diagnostic;
+}
+
+export function classifyCodexError(error) {
+  const detail = getCodexErrorDetails(error).map(([, value]) => value).join(" ").toLowerCase();
+
   if (/subscription_sharing_usage_limit_exceeded|\b(?:usage|quota)\b.{0,40}\b(?:limit|exceeded|reached)\b/.test(detail)) {
     return "usage_limited";
   }
