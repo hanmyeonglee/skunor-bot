@@ -1,0 +1,18 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 60s
+    env_file:
+      - .env
+    environment:
+      CODEX_HOME: /data/codex
+      DATABASE_PATH: /data/bot.sqlite3
+      HOST: 0.0.0.0
+      PORT: "8080"
+    volumes:
+      - bot-data:/data
+
+volumes:
+  bot-data:
