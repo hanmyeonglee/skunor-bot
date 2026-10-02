@@ -20,6 +20,29 @@ extends = ":read-only"
 ":minimal" = "read"
 "/workspace" = "read"
 "/data" = "deny"
+# Codex creates executable dispatch symlinks under CODEX_HOME/tmp/arg0.
+# Allow only this directory so the sandbox helper can start without exposing auth data.
+"/data/codex/tmp/arg0" = "read"
+"/app" = "deny"
+"/tmp" = "deny"
+
+[permissions.discord_research.network]
+enabled = false
+`;
+
+const PREVIOUS_CODEX_HOME_CONFIG = `# Managed by skunor-bot. Use a dedicated CODEX_HOME volume.
+approval_policy = "never"
+default_permissions = "discord_research"
+
+[permissions.discord_research]
+description = "Read-only research with no local command network access"
+extends = ":read-only"
+
+[permissions.discord_research.filesystem]
+":root" = "deny"
+":minimal" = "read"
+"/workspace" = "read"
+"/data" = "deny"
 "/app" = "deny"
 "/tmp" = "deny"
 
@@ -41,7 +64,11 @@ export function ensureCodexHomeConfig(codexHome) {
 
   if (fs.existsSync(configPath)) {
     const current = fs.readFileSync(configPath, "utf8");
-    if (current !== CODEX_HOME_CONFIG) {
+    if (current === PREVIOUS_CODEX_HOME_CONFIG) {
+      const temporaryConfigPath = path.join(codexHome, `config.toml.${process.pid}.tmp`);
+      fs.writeFileSync(temporaryConfigPath, CODEX_HOME_CONFIG, { mode: 0o600, flag: "wx" });
+      fs.renameSync(temporaryConfigPath, configPath);
+    } else if (current !== CODEX_HOME_CONFIG) {
       throw new Error("CODEX_HOME contains a config.toml that does not match the bot's required sandbox profile");
     }
     fs.chmodSync(configPath, 0o600);
