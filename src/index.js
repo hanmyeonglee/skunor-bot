@@ -141,8 +141,8 @@ function isCodexLoggedIn() {
   });
 }
 
-function formatLoginOutput(rawOutput) {
-  const output = rawOutput
+function cleanCodexOutput(rawOutput) {
+  return rawOutput
     .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
     .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "")
     .replace(/\r/g, "\n")
@@ -153,11 +153,26 @@ function formatLoginOutput(rawOutput) {
     .join("\n")
     .replace(/```/g, "` ` `")
     .slice(-1_500);
+}
+
+function formatLoginOutput(rawOutput) {
+  const output = cleanCodexOutput(rawOutput);
 
   if (!output) {
     return "Codex 기기 로그인을 시작했습니다. 인증 안내가 표시되기를 기다리고 있습니다.";
   }
   return `Codex 기기 로그인 안내입니다. 외부 브라우저에서 주소를 열고 표시된 코드를 입력해 주세요.\n\n${output}`;
+}
+
+function formatLoginFailure(rawOutput, error) {
+  const output = cleanCodexOutput(rawOutput);
+  const exitCode = Number.isInteger(error.exitCode) ? ` (종료 코드 ${error.exitCode})` : "";
+
+  if (!output) {
+    return `Codex CLI가 인증 안내를 출력하지 않고 종료했습니다${exitCode}. 컨테이너의 외부 연결과 계정의 기기 인증 허용 여부를 확인한 뒤 다시 시도해 주세요.`;
+  }
+
+  return `Codex CLI가 인증을 완료하지 못했습니다${exitCode}. CLI 출력은 다음과 같습니다.\n\n${output}`;
 }
 
 function runCodexDeviceLogin(onOutput) {
@@ -197,6 +212,7 @@ function runCodexDeviceLogin(onOutput) {
       } else {
         finish(() => reject(Object.assign(new Error("Codex 기기 로그인이 완료되지 않았습니다."), {
           kind: "login_not_completed",
+          exitCode: code,
         })));
       }
     });
@@ -257,8 +273,11 @@ async function handleLoginCommand(interaction) {
         log("codex_login_completed");
       } catch (error) {
         if (outputTimer !== null) clearTimeout(outputTimer);
-        log("codex_login_failed", { category: error.kind || "login_failed" });
-        await updateLoginInteraction(interaction, "Codex 로그인을 완료하지 못했습니다. `/login`을 다시 실행해 주세요.");
+        log("codex_login_failed", {
+          category: error.kind || "login_failed",
+          ...(Number.isInteger(error.exitCode) ? { exitCode: error.exitCode } : {}),
+        });
+        await updateLoginInteraction(interaction, formatLoginFailure(rawOutput, error));
       }
     });
   } finally {
