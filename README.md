@@ -46,7 +46,7 @@ Compose는 호스트 포트를 공개하지 않습니다. 봇은 Discord Gateway
 
 Codex CLI와 Discord Gateway, Codex 서비스에 대한 outbound HTTPS/WebSocket 연결이 필요합니다. 이 저장소의 Compose는 일반 Docker bridge 네트워크를 사용합니다. `cubus.sh`의 내부 전용 `web` 네트워크에만 연결하면 외부 연결이 차단될 수 있으므로, 중앙 Compose에 서비스를 옮길 때는 egress가 가능한 bridge 네트워크도 연결해야 합니다. health endpoint를 외부 ingress에 공개할 필요는 없습니다.
 
-Codex의 읽기 전용 로컬 명령 샌드박스가 Linux 컨테이너에서 작동해야 합니다. 호스트 커널이 필요한 sandbox 기능을 막으면 요청은 안전을 위해 실패할 수 있습니다. 이때 전체 파일 접근 권한을 열어 우회하지 마세요.
+Codex의 읽기 전용 로컬 명령 샌드박스가 Linux 컨테이너에서 작동해야 합니다. 실행 이미지에는 배포판의 `bubblewrap` 패키지가 포함됩니다. 컨테이너에서도 user namespace 생성이 허용되어야 하므로 Docker 호스트에서 `sysctl kernel.unprivileged_userns_clone` 값이 `1`인지 확인하세요. `0`이면 호스트 전체에 적용되는 설정을 바꾸기 전에 서버 보안 정책을 확인하고, 필요한 경우에만 활성화하세요. Ubuntu AppArmor가 user namespace를 제한하면 Codex의 [Linux sandbox 안내](https://learn.chatgpt.com/docs/sandboxing)에 따라 `bwrap` AppArmor 프로필을 적용하세요. 호스트 커널이나 Docker 보안 정책이 샌드박스 기능을 막으면 요청은 안전을 위해 실패할 수 있습니다. 이때 전체 파일 접근 권한을 열거나 컨테이너를 `privileged`로 실행해 우회하지 마세요.
 
 ## Codex 계정 사용 제한
 
