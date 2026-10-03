@@ -1264,12 +1264,6 @@ async function loadQnaChannelContext(channel, beforeTimestamp) {
     .filter((message) => !message.content.startsWith("🔎 **분석 진행 상황**"))
     .sort((first, second) => first.createdTimestamp - second.createdTimestamp);
 
-  const latestHumanMessage = [...recentMessages]
-    .reverse()
-    .find((message) => !message.author.bot) ?? null;
-  const anchor = latestHumanMessage && !latestHumanMessage.hasThread
-    ? latestHumanMessage
-    : null;
   const history = recentMessages.slice(-QNA_CONTEXT_MESSAGE_LIMIT).map((message) => {
     const displayName = message.member?.displayName
       || message.author.globalName
@@ -1283,7 +1277,7 @@ async function loadQnaChannelContext(channel, beforeTimestamp) {
     };
   });
 
-  return { anchor, history };
+  return { history };
 }
 
 async function processInitialQnaRequest({
@@ -1343,44 +1337,45 @@ async function handleQnaCommand(interaction) {
     return;
   }
 
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   if (interaction.channel?.isThread?.()) {
-    await interaction.editReply("새 Q&A는 일반 채널에서 시작해 주세요. 기존 Q&A 스레드에서는 메시지를 바로 보내 이어서 질문할 수 있습니다.");
+    await interaction.reply({
+      content: "새 Q&A는 일반 채널에서 시작해 주세요. 기존 Q&A 스레드에서는 메시지를 바로 보내 이어서 질문할 수 있습니다.",
+      flags: MessageFlags.Ephemeral,
+    });
     return;
   }
 
   const question = interaction.options.getString("question", true).trim();
   if (!question) {
-    await interaction.editReply("질문 내용을 입력해 주세요.");
+    await interaction.reply({
+      content: "질문 내용을 입력해 주세요.",
+      flags: MessageFlags.Ephemeral,
+    });
     return;
   }
 
+  // A slash command is an interaction, not a user-authored channel message.
+  // Use its public response as the stable thread anchor instead of an earlier chat message.
+  await interaction.deferReply();
+
   let thread = null;
-  let createdAnchor = null;
   try {
-    const { anchor: recentConversationMessage, history } = await loadQnaChannelContext(
+    const { history } = await loadQnaChannelContext(
       interaction.channel,
       interaction.createdTimestamp,
-    );
-    let threadAnchor = recentConversationMessage;
-    if (!threadAnchor) {
-      createdAnchor = await interaction.channel.send({
-        content: "Q&A 요청 스레드",
-        allowedMentions: { parse: [] },
-      });
-      threadAnchor = createdAnchor;
-    }
-
-    const threadName = `Q&A · ${compactProgressText(question, 88)}`;
-    thread = await threadAnchor.startThread(
-      {
-        name: threadName,
-        reason: `Q&A requested by ${interaction.user.id}`,
-      },
     );
     const displayName = interaction.member?.displayName
       || interaction.user.globalName
       || interaction.user.username;
+    const threadName = `Q&A · ${compactProgressText(question, 88)}`;
+    const threadAnchor = await interaction.editReply({
+      content: `**${displayName}의 Q&A 요청**\n${question}`,
+      allowedMentions: { parse: [] },
+    });
+    thread = await threadAnchor.startThread({
+      name: threadName,
+      reason: `Q&A requested by ${interaction.user.id}`,
+    });
     const sourceMessage = await thread.send({
       content: `**${displayName}의 질문:**\n${question}`,
       allowedMentions: { parse: [] },
@@ -1433,7 +1428,10 @@ async function handleQnaCommand(interaction) {
       contextMessageCount: history.length,
     });
     try {
-      await interaction.editReply(`Q&A 스레드를 열었습니다: <#${thread.id}>`);
+      await interaction.editReply({
+        content: `**${displayName}의 Q&A 요청**\n${question}\n\n스레드: <#${thread.id}>`,
+        allowedMentions: { parse: [] },
+      });
     } catch (error) {
       log("qna_interaction_ack_failed", {
         threadId: thread.id,
@@ -1446,13 +1444,6 @@ async function handleQnaCommand(interaction) {
         await thread.setArchived(true);
       } catch {
         // Keep the original setup error for diagnostics.
-      }
-    }
-    if (createdAnchor) {
-      try {
-        await createdAnchor.delete();
-      } catch {
-        // A visible fallback anchor is harmless if Discord rejects deletion.
       }
     }
     log("qna_thread_creation_failed", {
