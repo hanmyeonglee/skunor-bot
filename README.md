@@ -40,13 +40,13 @@ docker compose logs -f bot
 
 첫 명령은 이미지를 빌드하고, 두 번째 명령은 봇을 상시 실행합니다. 처음 봇을 멘션하면 로그인 안내가 나오며, Discord에서 `/login`을 실행해 표시되는 주소와 코드를 사용해 외부 브라우저에서 Codex 계정을 승인하세요. 인증 상태는 봇 전체가 공유합니다.
 
-`bot-data` Docker 볼륨을 `/data`에 마운트해 SQLite DB, Codex 로그인 정보, Codex 대화를 보존합니다. 볼륨을 백업하고 서버 관리자만 접근하게 하세요. `docker compose down -v`는 이 데이터를 삭제합니다.
+`bot-data` Docker 볼륨을 `/data`에 마운트해 SQLite DB, Codex 로그인 정보, Codex 대화를 보존합니다. Codex 요청은 컨테이너 안에서 전체 접근 모드로 실행되므로 Codex 도구도 `/data`를 읽고 쓸 수 있습니다. 볼륨을 백업하고 서버 관리자만 접근하게 하세요. `docker compose down -v`는 이 데이터를 삭제합니다.
 
 Compose는 호스트 포트를 공개하지 않습니다. 봇은 Discord Gateway로 직접 연결하고 `0.0.0.0:8080`에 내부 health endpoint만 제공합니다. `/healthz`는 프로세스 liveness, `/readyz`는 Discord 연결 상태를 확인합니다. 공개 도메인이나 reverse proxy는 필요하지 않습니다.
 
 Codex CLI와 Discord Gateway, Codex 서비스에 대한 outbound HTTPS/WebSocket 연결이 필요합니다. 이 저장소의 Compose는 일반 Docker bridge 네트워크를 사용합니다. `cubus.sh`의 내부 전용 `web` 네트워크에만 연결하면 외부 연결이 차단될 수 있으므로, 중앙 Compose에 서비스를 옮길 때는 egress가 가능한 bridge 네트워크도 연결해야 합니다. health endpoint를 외부 ingress에 공개할 필요는 없습니다.
 
-Codex의 읽기 전용 로컬 명령 샌드박스가 Linux 컨테이너에서 작동해야 합니다. 실행 이미지에는 배포판의 `bubblewrap` 패키지가 포함됩니다. 컨테이너에서도 user namespace 생성이 허용되어야 하므로 Docker 호스트에서 `sysctl kernel.unprivileged_userns_clone` 값이 `1`인지 확인하세요. `0`이면 호스트 전체에 적용되는 설정을 바꾸기 전에 서버 보안 정책을 확인하고, 필요한 경우에만 활성화하세요. Ubuntu AppArmor가 user namespace를 제한하면 Codex의 [Linux sandbox 안내](https://learn.chatgpt.com/docs/sandboxing)에 따라 `bwrap` AppArmor 프로필을 적용하세요. 호스트 커널이나 Docker 보안 정책이 샌드박스 기능을 막으면 요청은 안전을 위해 실패할 수 있습니다. 이때 전체 파일 접근 권한을 열거나 컨테이너를 `privileged`로 실행해 우회하지 마세요.
+요청 처리는 Codex SDK의 `danger-full-access` 모드와 `approval_policy = "never"`를 사용합니다. Codex 내부의 `bubblewrap` 샌드박스와 승인 확인을 건너뛰고, Docker 컨테이너를 격리 경계로 사용합니다. 따라서 Codex 도구는 컨테이너 안에서 `node` 사용자가 접근 가능한 파일과 네트워크에 접근할 수 있습니다. Docker 호스트의 user namespace 설정이나 `bubblewrap` AppArmor 프로필은 필요하지 않습니다. 컨테이너에 Docker 소켓이나 무관한 호스트 디렉터리를 마운트하지 마세요.
 
 ## Codex 계정 사용 제한
 
