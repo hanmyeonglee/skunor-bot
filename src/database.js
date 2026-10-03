@@ -100,6 +100,49 @@ export class BotDatabase {
         value TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS scheduled_items (
+        id TEXT PRIMARY KEY,
+        guild_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        owner_user_id TEXT NOT NULL,
+        visibility TEXT NOT NULL CHECK (visibility IN ('personal', 'shared')),
+        kind TEXT NOT NULL CHECK (kind IN ('cron', 'event')),
+        title TEXT NOT NULL,
+        details TEXT,
+        task_prompt TEXT,
+        cron_expression TEXT,
+        event_at TEXT,
+        reminder_offsets TEXT NOT NULL DEFAULT '[15,5]',
+        timezone TEXT NOT NULL,
+        next_run_at TEXT,
+        status TEXT NOT NULL CHECK (status IN ('active', 'cancelled', 'completed')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS scheduled_items_due
+        ON scheduled_items(status, kind, next_run_at);
+
+      CREATE INDEX IF NOT EXISTS scheduled_items_guild_owner
+        ON scheduled_items(guild_id, owner_user_id, status);
+
+      CREATE TABLE IF NOT EXISTS schedule_occurrences (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        schedule_id TEXT NOT NULL REFERENCES scheduled_items(id),
+        run_type TEXT NOT NULL CHECK (run_type IN ('cron', 'event_reminder')),
+        scheduled_at TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled')),
+        result TEXT,
+        error TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT,
+        UNIQUE (schedule_id, run_type, scheduled_at)
+      );
+
+      CREATE INDEX IF NOT EXISTS schedule_occurrences_due
+        ON schedule_occurrences(status, scheduled_at);
     `);
 
     this.statements = {
@@ -161,6 +204,123 @@ export class BotDatabase {
         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
       `),
       deleteState: this.db.prepare("DELETE FROM bot_state WHERE key = ?"),
+      insertSchedule: this.db.prepare(`
+        INSERT INTO scheduled_items (
+          id, guild_id, channel_id, owner_user_id, visibility, kind, title, details,
+          task_prompt, cron_expression, event_at, reminder_offsets, timezone,
+          next_run_at, status, created_at, updated_at
+        ) VALUES (
+          @id, @guildId, @channelId, @ownerUserId, @visibility, @kind, @title, @details,
+          @taskPrompt, @cronExpression, @eventAt, @reminderOffsets, @timezone,
+          @nextRunAt, @status, @now, @now
+        )
+      `),
+      getSchedule: this.db.prepare("SELECT * FROM scheduled_items WHERE id = ?"),
+      listSchedules: this.db.prepare(`
+        SELECT *,
+          (SELECT substr(result, 1, 1500) FROM schedule_occurrences AS occurrence
+           WHERE occurrence.schedule_id = scheduled_items.id
+             AND occurrence.run_type = 'cron' AND occurrence.status = 'succeeded'
+           ORDER BY occurrence.scheduled_at DESC LIMIT 1) AS latest_result,
+          (SELECT scheduled_at FROM schedule_occurrences AS occurrence
+           WHERE occurrence.schedule_id = scheduled_items.id
+             AND occurrence.run_type = 'cron' AND occurrence.status = 'succeeded'
+           ORDER BY occurrence.scheduled_at DESC LIMIT 1) AS latest_run_at
+        FROM scheduled_items
+        WHERE guild_id = @guildId
+          AND (visibility = 'shared' OR owner_user_id = @userId)
+          AND (@includeInactive = 1 OR status = 'active')
+          AND (@query = '' OR
+            title LIKE @queryPattern COLLATE NOCASE OR
+            COALESCE(details, '') LIKE @queryPattern COLLATE NOCASE OR
+            COALESCE(task_prompt, '') LIKE @queryPattern COLLATE NOCASE OR
+            COALESCE(cron_expression, '') LIKE @queryPattern COLLATE NOCASE OR
+            id LIKE @queryPattern)
+          AND (@fromAt IS NULL OR COALESCE(event_at, next_run_at, created_at) >= @fromAt)
+          AND (@toAt IS NULL OR COALESCE(event_at, next_run_at, created_at) <= @toAt)
+        ORDER BY COALESCE(event_at, next_run_at, created_at) ASC
+        LIMIT @limit
+      `),
+      getDueCronSchedules: this.db.prepare(`
+        SELECT * FROM scheduled_items
+        WHERE kind = 'cron' AND status = 'active' AND next_run_at <= ?
+        ORDER BY next_run_at ASC
+        LIMIT ?
+      `),
+      getUpcomingEvents: this.db.prepare(`
+        SELECT * FROM scheduled_items
+        WHERE kind = 'event' AND status = 'active' AND event_at > ? AND event_at <= ?
+        ORDER BY event_at ASC
+        LIMIT ?
+      `),
+      insertOccurrence: this.db.prepare(`
+        INSERT OR IGNORE INTO schedule_occurrences (
+          schedule_id, run_type, scheduled_at, status, created_at
+        ) VALUES (@scheduleId, @runType, @scheduledAt, 'pending', @now)
+      `),
+      advanceCronSchedule: this.db.prepare(`
+        UPDATE scheduled_items SET next_run_at = @nextRunAt, updated_at = @now
+        WHERE id = @scheduleId AND kind = 'cron' AND status = 'active'
+      `),
+      pendingOccurrences: this.db.prepare(`
+        SELECT occurrence.*, schedule.guild_id, schedule.channel_id,
+          schedule.owner_user_id, schedule.visibility, schedule.kind,
+          schedule.title, schedule.details, schedule.task_prompt, schedule.timezone,
+          schedule.event_at
+        FROM schedule_occurrences AS occurrence
+        JOIN scheduled_items AS schedule ON schedule.id = occurrence.schedule_id
+        WHERE occurrence.status = 'pending' AND schedule.status = 'active'
+        ORDER BY occurrence.scheduled_at ASC
+        LIMIT ?
+      `),
+      claimOccurrence: this.db.prepare(`
+        UPDATE schedule_occurrences SET status = 'running', started_at = @now
+        WHERE id = @id AND status = 'pending'
+      `),
+      recoverRunningOccurrences: this.db.prepare(`
+        UPDATE schedule_occurrences SET status = 'pending', started_at = NULL
+        WHERE status = 'running'
+      `),
+      finishOccurrence: this.db.prepare(`
+        UPDATE schedule_occurrences SET status = @status, result = @result,
+          error = @error, completed_at = @now
+        WHERE id = @id AND status = 'running'
+      `),
+      completePastEvents: this.db.prepare(`
+        UPDATE scheduled_items SET status = 'completed', updated_at = @now
+        WHERE kind = 'event' AND status = 'active' AND event_at <= @now
+      `),
+      cancelExpiredEventReminders: this.db.prepare(`
+        UPDATE schedule_occurrences SET status = 'cancelled',
+          result = 'Skipped because the event start time had passed.', completed_at = @now
+        WHERE run_type = 'event_reminder' AND status IN ('pending', 'running')
+          AND schedule_id IN (
+            SELECT id FROM scheduled_items
+            WHERE kind = 'event' AND status = 'active' AND event_at <= @now
+          )
+      `),
+      ownedActiveSchedule: this.db.prepare(`
+        SELECT * FROM scheduled_items
+        WHERE id = @id AND guild_id = @guildId AND owner_user_id = @userId
+          AND status = 'active'
+      `),
+      updateSchedule: this.db.prepare(`
+        UPDATE scheduled_items SET title = @title, details = @details, visibility = @visibility,
+          task_prompt = @taskPrompt, cron_expression = @cronExpression,
+          event_at = @eventAt, timezone = @timezone, next_run_at = @nextRunAt,
+          status = @status, updated_at = @now
+        WHERE id = @id AND guild_id = @guildId AND owner_user_id = @userId
+          AND status = 'active'
+      `),
+      cancelSchedule: this.db.prepare(`
+        UPDATE scheduled_items SET status = 'cancelled', updated_at = @now
+        WHERE id = @id AND guild_id = @guildId AND owner_user_id = @userId
+          AND status = 'active'
+      `),
+      cancelPendingOccurrences: this.db.prepare(`
+        UPDATE schedule_occurrences SET status = 'cancelled', completed_at = @now
+        WHERE schedule_id = @scheduleId AND status IN ('pending', 'running')
+      `),
     };
 
     this.saveMemoryTransaction = this.db.transaction((entry) => {
@@ -173,6 +333,73 @@ export class BotDatabase {
       for (const term of allTerms) {
         insertTerm.run({ memoryId, term, weight: questionTerms.has(term) ? 1 : 0.35 });
       }
+    });
+
+    this.claimPendingOccurrencesTransaction = this.db.transaction((limit) => {
+      const pending = this.statements.pendingOccurrences.all(limit);
+      const claimed = [];
+      for (const occurrence of pending) {
+        const result = this.statements.claimOccurrence.run({ id: occurrence.id, now: now() });
+        if (result.changes === 1) claimed.push(occurrence);
+      }
+      return claimed;
+    });
+
+    this.insertReminderOccurrenceTransaction = this.db.transaction(({ scheduleId, scheduledAt }) => {
+      return this.statements.insertOccurrence.run({
+        scheduleId,
+        runType: "event_reminder",
+        scheduledAt,
+        now: now(),
+      }).changes === 1;
+    });
+
+    this.advanceCronOccurrenceTransaction = this.db.transaction(({ scheduleId, scheduledAt, nextRunAt }) => {
+      const insertion = this.statements.insertOccurrence.run({
+        scheduleId,
+        runType: "cron",
+        scheduledAt,
+        now: now(),
+      });
+      this.statements.advanceCronSchedule.run({ scheduleId, nextRunAt, now: now() });
+      return insertion.changes === 1;
+    });
+
+    this.updateScheduleTransaction = this.db.transaction(({ schedule, changes }) => {
+      const updated = {
+        ...schedule,
+        ...changes,
+        now: now(),
+      };
+      const result = this.statements.updateSchedule.run({
+        id: schedule.id,
+        guildId: schedule.guild_id,
+        userId: schedule.owner_user_id,
+        title: updated.title,
+        details: updated.details,
+        visibility: updated.visibility,
+        taskPrompt: updated.task_prompt,
+        cronExpression: updated.cron_expression,
+        eventAt: updated.event_at,
+        timezone: updated.timezone,
+        nextRunAt: updated.next_run_at,
+        status: updated.status,
+        now: updated.now,
+      });
+      const mustCancelPendingRuns = schedule.kind === "event"
+        ? "event_at" in changes
+        : "cron_expression" in changes || "timezone" in changes;
+      if (result.changes && mustCancelPendingRuns) {
+        this.statements.cancelPendingOccurrences.run({ scheduleId: schedule.id, now: updated.now });
+      }
+      return result.changes === 1 ? this.statements.getSchedule.get(schedule.id) : null;
+    });
+
+    this.cancelScheduleTransaction = this.db.transaction(({ scheduleId, guildId, userId }) => {
+      const currentTime = now();
+      const result = this.statements.cancelSchedule.run({ id: scheduleId, guildId, userId, now: currentTime });
+      if (result.changes) this.statements.cancelPendingOccurrences.run({ scheduleId, now: currentTime });
+      return result.changes === 1;
     });
   }
 
@@ -230,6 +457,89 @@ export class BotDatabase {
       termsJson: JSON.stringify(terms),
       limit,
     });
+  }
+
+  createSchedule(schedule) {
+    const currentTime = now();
+    this.statements.insertSchedule.run({
+      id: schedule.id,
+      guildId: schedule.guildId,
+      channelId: schedule.channelId,
+      ownerUserId: schedule.ownerUserId,
+      visibility: schedule.visibility,
+      kind: schedule.kind,
+      title: schedule.title,
+      details: schedule.details ?? null,
+      taskPrompt: schedule.taskPrompt ?? null,
+      cronExpression: schedule.cronExpression ?? null,
+      eventAt: schedule.eventAt ?? null,
+      reminderOffsets: JSON.stringify(schedule.reminderOffsets ?? [15, 5]),
+      timezone: schedule.timezone,
+      nextRunAt: schedule.nextRunAt ?? null,
+      status: schedule.status ?? "active",
+      now: currentTime,
+    });
+    return this.statements.getSchedule.get(schedule.id);
+  }
+
+  listSchedules({ guildId, userId, query = "", includeInactive = false, fromAt = null, toAt = null, limit = 50 }) {
+    return this.statements.listSchedules.all({
+      guildId,
+      userId,
+      query,
+      queryPattern: `%${query}%`,
+      includeInactive: includeInactive ? 1 : 0,
+      fromAt,
+      toAt,
+      limit: Math.min(Math.max(Number(limit) || 50, 1), 100),
+    });
+  }
+
+  getSchedule(scheduleId) {
+    return this.statements.getSchedule.get(scheduleId) ?? null;
+  }
+
+  updateSchedule({ scheduleId, guildId, userId, changes }) {
+    const schedule = this.statements.ownedActiveSchedule.get({ id: scheduleId, guildId, userId });
+    if (!schedule) return null;
+    return this.updateScheduleTransaction({ schedule, changes });
+  }
+
+  cancelSchedule({ scheduleId, guildId, userId }) {
+    return this.cancelScheduleTransaction({ scheduleId, guildId, userId });
+  }
+
+  getDueCronSchedules(nowIso, limit = 50) {
+    return this.statements.getDueCronSchedules.all(nowIso, limit);
+  }
+
+  advanceCronSchedule({ scheduleId, scheduledAt, nextRunAt }) {
+    return this.advanceCronOccurrenceTransaction({ scheduleId, scheduledAt, nextRunAt });
+  }
+
+  getUpcomingEvents(nowIso, throughIso, limit = 100) {
+    return this.statements.getUpcomingEvents.all(nowIso, throughIso, limit);
+  }
+
+  addEventReminderOccurrence(scheduleId, scheduledAt) {
+    return this.insertReminderOccurrenceTransaction({ scheduleId, scheduledAt });
+  }
+
+  claimPendingScheduleOccurrences(limit = 100) {
+    return this.claimPendingOccurrencesTransaction(Math.min(limit, 200));
+  }
+
+  recoverInterruptedScheduleOccurrences() {
+    return this.statements.recoverRunningOccurrences.run().changes;
+  }
+
+  finishScheduleOccurrence({ id, status, result = null, error = null }) {
+    this.statements.finishOccurrence.run({ id, status, result, error, now: now() });
+  }
+
+  completePastEvents(nowIso) {
+    this.statements.cancelExpiredEventReminders.run({ now: nowIso });
+    return this.statements.completePastEvents.run({ now: nowIso }).changes;
   }
 
   isUsageLimited() {

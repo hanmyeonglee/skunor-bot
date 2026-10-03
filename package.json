@@ -13,6 +13,7 @@
     "@openai/codex": "0.160.0",
     "@openai/codex-sdk": "0.160.0",
     "better-sqlite3": "13.0.3",
+    "cron-parser": "5.10.1",
     "discord.js": "14.27.0"
   }
 }

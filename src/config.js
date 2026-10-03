@@ -18,11 +18,19 @@ function positiveInteger(name, defaultValue) {
 }
 
 export function loadConfig() {
+  const scheduleTimezone = process.env.SCHEDULE_TIME_ZONE?.trim() || "Asia/Seoul";
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: scheduleTimezone }).format();
+  } catch {
+    throw new Error(`Invalid SCHEDULE_TIME_ZONE: ${scheduleTimezone}`);
+  }
+
   return {
     discordToken: requiredEnv("DISCORD_TOKEN"),
     allowedGuildId: requiredEnv("ALLOWED_GUILD_ID"),
     databasePath: process.env.DATABASE_PATH?.trim() || "./data/bot.sqlite3",
     codexHome: process.env.CODEX_HOME?.trim() || "./data/codex",
+    scheduleTimezone,
     host: process.env.HOST?.trim() || "0.0.0.0",
     port: positiveInteger("PORT", 8080),
     exceedMessage: process.env.EXCEED_MESSAGE?.trim() || DEFAULT_EXCEED_MESSAGE,

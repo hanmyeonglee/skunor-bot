@@ -13,6 +13,10 @@
 - API로 읽은 채널 기록은 SQLite에 복사하지 않습니다. 답변 근거로 사용한 메시지의 Discord 링크를 포함하고, 오래된 기록 전체를 읽지 않았다면 읽은 범위를 밝힙니다. 원문은 Codex 대화 세션에 포함될 수 있습니다.
 - 이전 조사 결과 메모리는 허용된 서버 안에서 공유합니다. 비슷한 과거 질문과 답변을 SQLite에서 찾아 새 요청에 참고 자료로 전달합니다.
 - SQLite에는 멘션으로 들어온 질문, 봇의 답변, Codex 대화 스레드 ID와 조사 메모리가 저장됩니다.
+- 일정 기능은 Codex의 로컬 `skunor_schedule` MCP 도구와 봇의 SQLite 스케줄러를 사용합니다. 반복 작업은 등록한 채널에서 설정한 cron 시각에 Codex가 실행하고 결과를 등록자 멘션과 함께 보냅니다. 일정은 시작 15분 전과 5분 전에 등록 채널에서 등록자에게 알립니다.
+- 일정 공개 범위는 기본적으로 개인이며, 등록자만 조회·수정·취소할 수 있습니다. "공용"으로 지정한 일정은 서버 멤버가 조회할 수 있고 변경은 등록자만 할 수 있습니다. 개인 일정 알림도 요청에서 등록한 채널로 전송됩니다.
+- cron 반복 작업의 시각대와 일정 해석 기본값은 `SCHEDULE_TIME_ZONE`이며 기본값은 `Asia/Seoul`입니다. 모호한 날짜나 시각은 Codex가 확인을 요청합니다. 봇이 중단된 동안 지나간 cron 회차는 재시작 후 한 번만 따라잡고, 그 사이 누락된 모든 회차를 몰아서 실행하지 않습니다.
+- 일정과 실행 이력·결과는 SQLite의 `scheduled_items` 및 `schedule_occurrences` 테이블에 저장됩니다. 봇이 중단된 동안의 일정 알림은 재시작 시점에 행사가 아직 시작 전이면 유효한 알림만 보냅니다.
 - Discord API 호출을 위해 Codex 요청 프로세스에는 `DISCORD_BOT_TOKEN`과 `DISCORD_GUILD_ID` 환경 변수를 전달합니다. 스킬은 토큰을 인증 헤더에만 사용하고 읽기 전용 GET 요청만 하도록 지시하지만, 이 제한은 컨테이너 내부의 기술적 차단은 아닙니다. Codex는 승인 없이 전체 접근 모드로 실행되므로 `node` 사용자가 접근 가능한 DB, `/data/codex`, 환경 변수에도 접근할 수 있습니다.
 - Codex가 사용량 한도 오류를 반환하면 SQLite에 상태를 저장하고 `EXCEED_MESSAGE`를 보냅니다. 한도 오류만으로 초기화 시각을 알 수 없으므로, 사용량이 돌아온 뒤 `@봇 재확인`을 보내 직접 확인합니다.
 
@@ -71,6 +75,7 @@ Codex CLI와 Discord Gateway, Codex 서비스에 대한 outbound HTTPS/WebSocket
 | `ALLOWED_GUILD_ID` | 봇이 응답할 Discord 서버 ID |
 | `DATABASE_PATH` | SQLite 파일 경로. Compose 기본값 `/data/bot.sqlite3`, 로컬 기본값 `./data/bot.sqlite3` |
 | `CODEX_HOME` | 인증 및 Codex 세션 저장 경로. Compose 기본값 `/data/codex`, 로컬 기본값 `./data/codex` |
+| `SCHEDULE_TIME_ZONE` | cron과 기본 일정 시각대. 기본값 `Asia/Seoul` |
 | `HOST`, `PORT` | 내부 health HTTP 서버 설정. 기본값 `0.0.0.0:8080` |
 | `EXCEED_MESSAGE` | Codex 사용 한도에 도달했을 때 보낼 고정 문구 |
 
@@ -78,7 +83,7 @@ Codex CLI와 Discord Gateway, Codex 서비스에 대한 outbound HTTPS/WebSocket
 
 ## 메모리 및 기록
 
-SQLite 파일에는 Discord 대화 원문과 성공한 요청·응답이 저장됩니다. 서버 내 요청과 답변은 공용 조사 메모리에 검색용 단어로도 기록되며, 다음 요청에서 관련 과거 답변 일부가 맥락으로 전달됩니다. Codex가 저장하는 이어가기용 세션은 `/data/codex` 아래에 보관됩니다. 데이터 보관 기간이나 삭제 기능은 아직 설정하지 않았으므로, 필요한 경우 SQLite 파일과 Codex 세션을 함께 백업·삭제해야 합니다.
+SQLite 파일에는 Discord 대화 원문과 성공한 요청·응답이 저장됩니다. 서버 내 요청과 답변은 공용 조사 메모리에 검색용 단어로도 기록되며, 다음 요청에서 관련 과거 답변 일부가 맥락으로 전달됩니다. 등록된 반복 작업·일정과 반복 실행 결과도 SQLite에 저장됩니다. Codex가 저장하는 이어가기용 세션은 `/data/codex` 아래에 보관됩니다. 데이터 보관 기간이나 일괄 삭제 기능은 아직 설정하지 않았으므로, 필요한 경우 SQLite 파일과 Codex 세션을 함께 백업·삭제해야 합니다.
 
 ## 로컬 실행
 

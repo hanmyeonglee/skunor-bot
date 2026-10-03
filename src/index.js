@@ -1,5 +1,6 @@
 import http from "node:http";
 import { spawn } from "node:child_process";
+import { CronExpressionParser } from "cron-parser";
 import {
   Client,
   GatewayIntentBits,
@@ -14,6 +15,8 @@ import {
   createCodexCliEnvironment,
   createCodexClient,
   createThreadOptions,
+  ensureCodexHomeConfig,
+  installDiscordApiSkill,
   describeCodexError,
 } from "./codex.js";
 
@@ -26,12 +29,9 @@ const THREAD_HISTORY_LIMIT = 12;
 const MEMORY_LIMIT = 4;
 
 const config = loadConfig();
+ensureCodexHomeConfig(config.codexHome);
+installDiscordApiSkill(config.codexHome);
 const database = new BotDatabase(config.databasePath);
-const codex = createCodexClient({
-  codexHome: config.codexHome,
-  discordToken: config.discordToken,
-  guildId: config.allowedGuildId,
-});
 const codexThreadOptions = createThreadOptions();
 const client = new Client({
   intents: [
@@ -47,6 +47,8 @@ let healthServer;
 let activeJob = null;
 let loginRequested = false;
 let activeLoginChild = null;
+let schedulePollTimer = null;
+let schedulePollRunning = false;
 
 function log(event, fields = {}) {
   console.log(JSON.stringify({
@@ -67,6 +69,19 @@ function createConversationKey(message) {
   const isDiscordThread = message.channel.isThread?.() ?? false;
   const authorPart = isDiscordThread ? "shared" : message.author.id;
   return `${message.guildId}:${message.channelId}:${authorPart}`;
+}
+
+function createCodexForMessage(message, { allowScheduleWrites = true } = {}) {
+  return createCodexClient({
+    codexHome: config.codexHome,
+    discordToken: config.discordToken,
+    guildId: config.allowedGuildId,
+    channelId: message.channelId,
+    requesterUserId: message.author.id,
+    databasePath: config.databasePath,
+    timezone: config.scheduleTimezone,
+    allowScheduleWrites,
+  });
 }
 
 function splitForDiscord(text, maxLength) {
@@ -390,6 +405,7 @@ function boundAnswer(answer) {
 }
 
 async function processQuotaRecheck(conversationKey, sourceMessage) {
+  const codex = createCodexForMessage(sourceMessage, { allowScheduleWrites: false });
   const probe = codex.startThread(codexThreadOptions);
   await probe.run([
     "Check whether you can answer with the current Codex account.",
@@ -442,14 +458,25 @@ async function processRequest({
   }
 
   let thread = null;
+  let codex = null;
   let currentPrompt = "";
   let failureStage = "conversation_load";
+  const requestTime = new Date();
   const discordContext = {
     guildId: sourceMessage.guildId,
     channelId: sourceMessage.channelId,
     isThread: sourceMessage.channel?.isThread?.() ?? false,
+    requesterUserId: sourceMessage.author.id,
+    timezone: config.scheduleTimezone,
+    currentTimeUtc: requestTime.toISOString(),
+    currentTimeLocal: new Intl.DateTimeFormat("ko-KR", {
+      timeZone: config.scheduleTimezone,
+      dateStyle: "full",
+      timeStyle: "long",
+    }).format(requestTime),
   };
   try {
+    codex = createCodexForMessage(sourceMessage);
     const conversation = database.getConversation(conversationKey);
     failureStage = "memory_lookup";
     const memory = database.findRelevantMemory(guildId, question, MEMORY_LIMIT);
@@ -541,6 +568,193 @@ async function processRequest({
   }
 }
 
+function nextCronRun(cronExpression, timezone, currentDate) {
+  const iterator = CronExpressionParser.parse(cronExpression, { currentDate, tz: timezone });
+  return iterator.next().toDate().toISOString();
+}
+
+function formatScheduleTime(isoDate, timezone) {
+  return new Intl.DateTimeFormat("ko-KR", {
+    timeZone: timezone,
+    dateStyle: "full",
+    timeStyle: "short",
+  }).format(new Date(isoDate));
+}
+
+async function sendScheduleNotification(schedule, content) {
+  let channel = client.channels.cache.get(schedule.channel_id);
+  if (!channel) channel = await client.channels.fetch(schedule.channel_id);
+  if (!channel?.isTextBased?.() || typeof channel.send !== "function") {
+    throw new Error("The schedule's Discord channel is no longer available for messages.");
+  }
+
+  const mention = `<@${schedule.owner_user_id}>`;
+  const chunks = splitForDiscord(boundAnswer(content), config.maxDiscordMessageChars);
+  chunks[0] = `${mention}\n${chunks[0]}`;
+  for (const [index, chunk] of chunks.entries()) {
+    await channel.send({
+      content: chunk,
+      allowedMentions: index === 0
+        ? { parse: [], users: [schedule.owner_user_id] }
+        : { parse: [] },
+    });
+  }
+}
+
+async function executeScheduleOccurrence(occurrence) {
+  try {
+    if (occurrence.run_type === "event_reminder") {
+      if (Date.parse(occurrence.event_at) <= Date.now()) {
+        database.finishScheduleOccurrence({
+          id: occurrence.id,
+          status: "succeeded",
+          result: "Skipped because the event start time had passed before the queued reminder ran.",
+        });
+        return;
+      }
+      const reminderMinutes = Math.round((Date.parse(occurrence.event_at) - Date.parse(occurrence.scheduled_at)) / 60_000);
+      await sendScheduleNotification(occurrence, [
+        `일정 알림: **${occurrence.title}** 시작 ${reminderMinutes}분 전입니다.`,
+        `시작 시각: ${formatScheduleTime(occurrence.event_at, occurrence.timezone)} (${occurrence.timezone})`,
+        ...(occurrence.details ? [`메모: ${occurrence.details}`] : []),
+      ].join("\n"));
+      database.finishScheduleOccurrence({
+        id: occurrence.id,
+        status: "succeeded",
+        result: `Sent the ${reminderMinutes}-minute reminder.`,
+      });
+      log("schedule_reminder_sent", { scheduleId: occurrence.schedule_id, channelId: occurrence.channel_id });
+      return;
+    }
+
+    if (database.isUsageLimited()) {
+      await sendScheduleNotification(occurrence, config.exceedMessage);
+      database.finishScheduleOccurrence({ id: occurrence.id, status: "failed", error: "usage_limited" });
+      return;
+    }
+    if (!(await isCodexLoggedIn())) {
+      await sendScheduleNotification(occurrence, LOGIN_REQUIRED_MESSAGE);
+      database.finishScheduleOccurrence({ id: occurrence.id, status: "failed", error: "not_authenticated" });
+      return;
+    }
+
+    const requestContext = {
+      author: { id: occurrence.owner_user_id },
+      guildId: occurrence.guild_id,
+      channelId: occurrence.channel_id,
+    };
+    const codex = createCodexForMessage(requestContext, { allowScheduleWrites: false });
+    const thread = codex.startThread(codexThreadOptions);
+    const runAt = new Date();
+    const discordContext = {
+      guildId: occurrence.guild_id,
+      channelId: occurrence.channel_id,
+      isThread: false,
+      requesterUserId: occurrence.owner_user_id,
+      timezone: occurrence.timezone,
+      currentTimeUtc: runAt.toISOString(),
+      currentTimeLocal: formatScheduleTime(runAt.toISOString(), occurrence.timezone),
+      scheduledTaskId: occurrence.schedule_id,
+    };
+    const prompt = buildCodexPrompt({
+      question: `예약된 반복 작업을 이번 회차에 수행하세요. 결과를 등록 채널에 전달할 수 있도록 완결된 답변으로 작성하세요.\n\n작업 이름: ${occurrence.title}\n\n요청 내용:\n${occurrence.task_prompt}`,
+      discordContext,
+    });
+    const turn = await thread.run(prompt);
+    const answer = boundAnswer(turn.finalResponse?.trim() || "예약 작업을 수행했지만 답변 텍스트가 비어 있습니다.");
+    await sendScheduleNotification(occurrence, answer);
+    database.finishScheduleOccurrence({ id: occurrence.id, status: "succeeded", result: answer });
+    log("schedule_task_completed", { scheduleId: occurrence.schedule_id, channelId: occurrence.channel_id });
+  } catch (error) {
+    const errorKind = classifyCodexError(error);
+    let message = USER_ERROR_TEXT;
+    if (errorKind === "usage_limited") {
+      database.setUsageLimited(true);
+      message = config.exceedMessage;
+    } else if (errorKind === "not_authenticated") {
+      message = LOGIN_REQUIRED_MESSAGE;
+    }
+
+    try {
+      await sendScheduleNotification(occurrence, message);
+    } catch (deliveryError) {
+      log("schedule_notification_failed", {
+        scheduleId: occurrence.schedule_id,
+        channelId: occurrence.channel_id,
+        diagnostic: describeCodexError(deliveryError),
+      });
+    }
+    database.finishScheduleOccurrence({
+      id: occurrence.id,
+      status: "failed",
+      error: describeCodexError(error, { redactValues: [config.discordToken] }),
+    });
+    log("schedule_execution_failed", {
+      category: errorKind,
+      scheduleId: occurrence.schedule_id,
+      channelId: occurrence.channel_id,
+      diagnostic: describeCodexError(error, { redactValues: [config.discordToken] }),
+    });
+  }
+}
+
+function pollSchedules() {
+  if (schedulePollRunning || shuttingDown || !client.isReady()) return;
+  schedulePollRunning = true;
+  try {
+    const currentTime = new Date();
+    const nowIso = currentTime.toISOString();
+    for (const schedule of database.getDueCronSchedules(nowIso)) {
+      try {
+        database.advanceCronSchedule({
+          scheduleId: schedule.id,
+          scheduledAt: schedule.next_run_at,
+          nextRunAt: nextCronRun(schedule.cron_expression, schedule.timezone, currentTime),
+        });
+      } catch (error) {
+        log("schedule_cron_invalid", {
+          scheduleId: schedule.id,
+          diagnostic: describeCodexError(error),
+        });
+      }
+    }
+
+    const eventReminderHorizon = new Date(currentTime.getTime() + 15 * 60_000).toISOString();
+    for (const schedule of database.getUpcomingEvents(nowIso, eventReminderHorizon, 200)) {
+      let reminderOffsets;
+      try {
+        reminderOffsets = JSON.parse(schedule.reminder_offsets);
+      } catch {
+        reminderOffsets = [15, 5];
+      }
+      const eventAt = Date.parse(schedule.event_at);
+      for (const offsetMinutes of reminderOffsets) {
+        const reminderAt = eventAt - offsetMinutes * 60_000;
+        const nextReminderOffset = reminderOffsets.filter((offset) => offset < offsetMinutes).sort((a, b) => b - a)[0];
+        const createdAfterReminder = Date.parse(schedule.created_at) > reminderAt;
+        const laterReminderIsDue = nextReminderOffset !== undefined
+          && currentTime.getTime() >= eventAt - nextReminderOffset * 60_000;
+        if (reminderAt > currentTime.getTime() || createdAfterReminder || laterReminderIsDue) continue;
+        database.addEventReminderOccurrence(schedule.id, new Date(reminderAt).toISOString());
+      }
+    }
+
+    database.completePastEvents(nowIso);
+    for (const occurrence of database.claimPendingScheduleOccurrences()) {
+      void enqueue(() => executeScheduleOccurrence(occurrence)).catch((error) => {
+        log("schedule_queue_failed", {
+          scheduleId: occurrence.schedule_id,
+          diagnostic: describeCodexError(error, { redactValues: [config.discordToken] }),
+        });
+      });
+    }
+  } catch (error) {
+    log("schedule_poll_failed", { diagnostic: describeCodexError(error) });
+  } finally {
+    schedulePollRunning = false;
+  }
+}
+
 async function handleMessage(message) {
   if (!message.guildId || message.guildId !== config.allowedGuildId) return;
   if (message.author.bot || !client.user || !message.mentions.users.has(client.user.id)) return;
@@ -626,6 +840,11 @@ async function main() {
 
   client.once("ready", async () => {
     log("discord_ready", { botId: client.user.id });
+    const recoveredRuns = database.recoverInterruptedScheduleOccurrences();
+    if (recoveredRuns > 0) log("schedule_runs_recovered", { count: recoveredRuns });
+    schedulePollTimer = setInterval(pollSchedules, 15_000);
+    schedulePollTimer.unref?.();
+    pollSchedules();
     try {
       await client.application.commands.create(
         new SlashCommandBuilder()
@@ -659,6 +878,7 @@ async function main() {
     shuttingDown = true;
     log("shutdown_started", { signal });
     activeLoginChild?.kill("SIGTERM");
+    if (schedulePollTimer) clearInterval(schedulePollTimer);
     client.destroy();
     healthServer.close();
 
