@@ -83,19 +83,15 @@ function splitForDiscord(text, maxLength) {
   return parts.length > 0 ? parts : ["(빈 답변)"];
 }
 
-async function postAnswer(sourceMessage, placeholder, answer) {
+async function postAnswer(sourceMessage, answer) {
   const boundedAnswer = boundAnswer(answer);
   const chunks = splitForDiscord(boundedAnswer, config.maxDiscordMessageChars);
   const sendOptions = { allowedMentions: { parse: [] } };
 
-  if (placeholder) {
-    await placeholder.edit({ content: chunks[0], allowedMentions: { parse: [] } });
-  } else {
-    await sourceMessage.reply({
-      content: chunks[0],
-      allowedMentions: { parse: [], repliedUser: false },
-    });
-  }
+  await sourceMessage.reply({
+    content: chunks[0],
+    allowedMentions: { parse: [], repliedUser: false },
+  });
 
   for (const chunk of chunks.slice(1)) {
     await sourceMessage.channel.send({ content: chunk, ...sendOptions });
@@ -116,6 +112,90 @@ function enqueue(job) {
   });
   queueTail = completion.catch(() => {});
   return completion;
+}
+
+function resolveStatusEmoji(message, name, fallback) {
+  return message.guild?.emojis.cache.find((emoji) => emoji.name?.toLowerCase() === name) || fallback;
+}
+
+function startTypingIndicator(channel) {
+  let stopped = false;
+  let sending = false;
+  let failureLogged = false;
+
+  const sendTyping = async () => {
+    if (stopped || sending) return;
+    sending = true;
+    try {
+      await channel.sendTyping();
+    } catch (error) {
+      if (!failureLogged) {
+        failureLogged = true;
+        log("typing_indicator_failed", {
+          channelId: channel.id,
+          diagnostic: describeCodexError(error),
+        });
+      }
+    } finally {
+      sending = false;
+    }
+  };
+
+  void sendTyping();
+  const timer = setInterval(() => void sendTyping(), 8_000);
+  timer.unref?.();
+
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
+}
+
+async function startMessageStatus(message) {
+  const stopTyping = startTypingIndicator(message.channel);
+  let loadingReaction = null;
+
+  try {
+    loadingReaction = await message.react(resolveStatusEmoji(message, "loading", "⏳"));
+  } catch (error) {
+    log("request_status_reaction_failed", {
+      stage: "loading",
+      messageId: message.id,
+      channelId: message.channelId,
+      diagnostic: describeCodexError(error),
+    });
+  }
+
+  let finished = false;
+  return async () => {
+    if (finished) return;
+    finished = true;
+    stopTyping();
+
+    if (loadingReaction && client.user) {
+      try {
+        await loadingReaction.users.remove(client.user.id);
+      } catch (error) {
+        log("request_status_reaction_failed", {
+          stage: "loading_remove",
+          messageId: message.id,
+          channelId: message.channelId,
+          diagnostic: describeCodexError(error),
+        });
+      }
+    }
+
+    try {
+      await message.react(resolveStatusEmoji(message, "check_mark", "✅"));
+    } catch (error) {
+      log("request_status_reaction_failed", {
+        stage: "complete",
+        messageId: message.id,
+        channelId: message.channelId,
+        diagnostic: describeCodexError(error),
+      });
+    }
+  };
 }
 
 function isCodexLoggedIn() {
@@ -291,8 +371,8 @@ function isQuotaRecheckRequest(question) {
   return /^(재확인|다시\s*확인|quota\s*check|status)$/i.test(question.trim());
 }
 
-async function saveReply(conversationKey, sourceMessage, placeholder, answer) {
-  const savedAnswer = await postAnswer(sourceMessage, placeholder, answer);
+async function saveReply(conversationKey, sourceMessage, answer) {
+  const savedAnswer = await postAnswer(sourceMessage, answer);
   database.addAssistantMessage(conversationKey, savedAnswer);
   return savedAnswer;
 }
@@ -303,7 +383,7 @@ function boundAnswer(answer) {
   return `${answer.slice(0, config.maxResponseChars - suffix.length)}${suffix}`;
 }
 
-async function processQuotaRecheck(conversationKey, sourceMessage, placeholder) {
+async function processQuotaRecheck(conversationKey, sourceMessage) {
   const probe = codex.startThread(codexThreadOptions);
   await probe.run([
     "Check whether you can answer with the current Codex account.",
@@ -312,28 +392,28 @@ async function processQuotaRecheck(conversationKey, sourceMessage, placeholder) 
 
   database.setUsageLimited(false);
   const answer = "Codex 사용 한도가 해제된 것을 확인했습니다. 원래 요청을 다시 멘션해 주세요.";
-  await saveReply(conversationKey, sourceMessage, placeholder, answer);
+  await saveReply(conversationKey, sourceMessage, answer);
   log("quota_recheck_succeeded");
 }
 
-async function processRequest({ sourceMessage, placeholder, question, conversationKey, guildId }) {
+async function processRequest({ sourceMessage, question, conversationKey, guildId }) {
   if (database.isUsageLimited()) {
     if (!isQuotaRecheckRequest(question)) {
-      await saveReply(conversationKey, sourceMessage, placeholder, config.exceedMessage);
+      await saveReply(conversationKey, sourceMessage, config.exceedMessage);
       return;
     }
 
     try {
-      await processQuotaRecheck(conversationKey, sourceMessage, placeholder);
+      await processQuotaRecheck(conversationKey, sourceMessage);
     } catch (error) {
       const errorKind = classifyCodexError(error);
       if (errorKind === "not_authenticated") {
-        await saveReply(conversationKey, sourceMessage, placeholder, LOGIN_REQUIRED_MESSAGE);
+        await saveReply(conversationKey, sourceMessage, LOGIN_REQUIRED_MESSAGE);
         log("codex_login_required", { channelId: sourceMessage.channelId });
       } else if (errorKind === "usage_limited") {
-        await saveReply(conversationKey, sourceMessage, placeholder, config.exceedMessage);
+        await saveReply(conversationKey, sourceMessage, config.exceedMessage);
       } else {
-        await saveReply(conversationKey, sourceMessage, placeholder, USER_ERROR_TEXT);
+        await saveReply(conversationKey, sourceMessage, USER_ERROR_TEXT);
         log("quota_recheck_failed", {
           category: errorKind,
           messageId: sourceMessage.id,
@@ -346,7 +426,7 @@ async function processRequest({ sourceMessage, placeholder, question, conversati
 
   if (isQuotaRecheckRequest(question)) {
     const answer = "현재 사용 한도 초과 상태로 기록되어 있지 않습니다.";
-    await saveReply(conversationKey, sourceMessage, placeholder, answer);
+    await saveReply(conversationKey, sourceMessage, answer);
     return;
   }
 
@@ -378,18 +458,18 @@ async function processRequest({ sourceMessage, placeholder, question, conversati
     database.setCodexThreadId(conversationKey, thread.id);
     database.saveResearchMemory({ guildId, conversationKey, question, answer });
     failureStage = "discord_reply";
-    await saveReply(conversationKey, sourceMessage, placeholder, answer);
+    await saveReply(conversationKey, sourceMessage, answer);
     log("request_completed", { channelId: sourceMessage.channelId });
   } catch (error) {
     const errorKind = classifyCodexError(error);
     if (errorKind === "not_authenticated") {
-      await saveReply(conversationKey, sourceMessage, placeholder, LOGIN_REQUIRED_MESSAGE);
+      await saveReply(conversationKey, sourceMessage, LOGIN_REQUIRED_MESSAGE);
       log("codex_login_required", { channelId: sourceMessage.channelId });
       return;
     }
     if (errorKind === "usage_limited") {
       database.setUsageLimited(true);
-      await saveReply(conversationKey, sourceMessage, placeholder, config.exceedMessage);
+      await saveReply(conversationKey, sourceMessage, config.exceedMessage);
       log("usage_limit_reached");
       return;
     }
@@ -409,19 +489,19 @@ async function processRequest({ sourceMessage, placeholder, question, conversati
         const answer = boundAnswer(turn.finalResponse?.trim() || "요청을 처리했지만 답변 텍스트가 비어 있습니다.");
         database.setCodexThreadId(conversationKey, replacementThread.id);
         database.saveResearchMemory({ guildId, conversationKey, question, answer });
-        await saveReply(conversationKey, sourceMessage, placeholder, answer);
+        await saveReply(conversationKey, sourceMessage, answer);
         log("request_completed_after_thread_restore", { channelId: sourceMessage.channelId });
         return;
       } catch (retryError) {
         const retryErrorKind = classifyCodexError(retryError);
         if (retryErrorKind === "not_authenticated") {
-          await saveReply(conversationKey, sourceMessage, placeholder, LOGIN_REQUIRED_MESSAGE);
+          await saveReply(conversationKey, sourceMessage, LOGIN_REQUIRED_MESSAGE);
           log("codex_login_required", { channelId: sourceMessage.channelId });
           return;
         }
         if (retryErrorKind === "usage_limited") {
           database.setUsageLimited(true);
-          await saveReply(conversationKey, sourceMessage, placeholder, config.exceedMessage);
+          await saveReply(conversationKey, sourceMessage, config.exceedMessage);
           log("usage_limit_reached");
           return;
         }
@@ -430,7 +510,7 @@ async function processRequest({ sourceMessage, placeholder, question, conversati
       }
     }
 
-    await saveReply(conversationKey, sourceMessage, placeholder, USER_ERROR_TEXT);
+    await saveReply(conversationKey, sourceMessage, USER_ERROR_TEXT);
     log("request_failed", {
       category: failureKind,
       stage: failureStage,
@@ -470,40 +550,34 @@ async function handleMessage(message) {
   });
   if (!inserted) return;
 
-  if (loginRequested) {
-    await saveReply(conversationKey, message, null, LOGIN_IN_PROGRESS_MESSAGE);
-    return;
-  }
-
-  if (!(await isCodexLoggedIn())) {
-    await saveReply(conversationKey, message, null, LOGIN_REQUIRED_MESSAGE);
-    log("codex_login_required", { channelId: message.channelId });
-    return;
-  }
-
-  if (database.isUsageLimited() && !isQuotaRecheckRequest(question)) {
-    await saveReply(conversationKey, message, null, config.exceedMessage);
-    return;
-  }
-
-  let placeholder = null;
+  const finishStatus = await startMessageStatus(message);
   try {
-    placeholder = await message.reply({
-      content: "요청을 접수했습니다. 순서대로 처리합니다.",
-      allowedMentions: { parse: [], repliedUser: false },
-    });
-  } catch {
-    log("acknowledgement_failed", { channelId: message.channelId });
-  }
+    if (loginRequested) {
+      await saveReply(conversationKey, message, LOGIN_IN_PROGRESS_MESSAGE);
+      return;
+    }
 
-  const completion = enqueue(() => processRequest({
-    sourceMessage: message,
-    placeholder,
-    question,
-    conversationKey,
-    guildId: message.guildId,
-  }));
-  await completion;
+    if (!(await isCodexLoggedIn())) {
+      await saveReply(conversationKey, message, LOGIN_REQUIRED_MESSAGE);
+      log("codex_login_required", { channelId: message.channelId });
+      return;
+    }
+
+    if (database.isUsageLimited() && !isQuotaRecheckRequest(question)) {
+      await saveReply(conversationKey, message, config.exceedMessage);
+      return;
+    }
+
+    const completion = enqueue(() => processRequest({
+      sourceMessage: message,
+      question,
+      conversationKey,
+      guildId: message.guildId,
+    }));
+    await completion;
+  } finally {
+    await finishStatus();
+  }
 }
 
 function startHealthServer() {
