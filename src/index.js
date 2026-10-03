@@ -346,99 +346,72 @@ function startTypingIndicator(channel) {
   };
 }
 
+function compactProgressText(value, maxChars) {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  const characters = Array.from(text);
+  return characters.length > maxChars
+    ? `${characters.slice(0, maxChars - 1).join("")}…`
+    : text;
+}
+
 function formatProgressPlan(items) {
   if (!Array.isArray(items)) return [];
   return items
     .filter((item) => item && typeof item.text === "string" && item.text.trim())
     .slice(0, 6)
     .map((item) => ({
-      text: Array.from(item.text.replace(/\s+/g, " ").trim()).slice(0, 110).join(""),
+      text: compactProgressText(item.text, 130),
       completed: item.completed === true,
     }));
 }
 
-function renderProgressMessage(plan, activity) {
+function renderProgressMessage(question, plan, activity) {
   const steps = plan ?? [];
   const activeIndex = steps.findIndex((step) => !step.completed);
-  const lines = steps.map((step, index) => {
-    if (step.completed) return `✅ ${step.text}`;
-    if (index === activeIndex) return `🔄 ${step.text}`;
-    return `▫️ ${step.text}`;
-  });
+  const lines = [
+    "🔎 **분석 진행 상황**",
+    `**요청:** ${compactProgressText(question, 220)}`,
+    "",
+  ];
 
-  if (activity) lines.push(`\n현재: ${activity}`);
-
-  if (lines.length === 0) {
-    lines.push(activity ? `⏳ ${activity}` : "⏳ 요청을 대기열에서 기다리고 있습니다.");
+  if (steps.length > 0) {
+    lines.push("**계획**");
+    lines.push(...steps.map((step, index) => {
+      if (step.completed) return `✅ ${step.text}`;
+      if (index === activeIndex) return `🔄 ${step.text}`;
+      return `▫️ ${step.text}`;
+    }));
+  } else if (!activity) {
+    lines.push("요청을 구체적인 조사 단계로 나누고 있습니다.");
   }
-  const content = ["🔎 **분석 진행 상황**", ...lines].join("\n");
+
+  if (activity) lines.push("", `**상세 활동:** ${activity}`);
+
+  const content = lines.join("\n");
   return content.length > 1_900 ? `${content.slice(0, 1_870)}…(일부 생략)` : content;
 }
 
 async function createRequestProgress(sourceMessage, question) {
-  let progressChannel = sourceMessage.channel;
-  let createdThread = false;
-
-  if (!(sourceMessage.channel.isThread?.() ?? false)) {
-    try {
-      let thread = sourceMessage.hasThread ? sourceMessage.thread : null;
-      if (!thread && sourceMessage.hasThread) {
-        thread = await sourceMessage.channel.threads.fetch(sourceMessage.id);
-      }
-      if (!thread) {
-        const excerpt = question.replace(/<@!?\d+>/g, "").replace(/\s+/g, " ").trim();
-        const threadName = `스쿠너 작업 · ${Array.from(excerpt || "요청").slice(0, 82).join("")}`;
-        thread = await sourceMessage.startThread({
-          name: threadName,
-          autoArchiveDuration: 1_440,
-        });
-        createdThread = true;
-      }
-      progressChannel = thread;
-    } catch (error) {
-      log("request_progress_thread_failed", {
-        messageId: sourceMessage.id,
-        channelId: sourceMessage.channelId,
-        diagnostic: describeCodexError(error),
-      });
-    }
-  }
-
-  const initialContent = renderProgressMessage(null, "요청을 대기열에서 기다리고 있습니다.");
+  const progressChannel = sourceMessage.channel;
+  const initialContent = renderProgressMessage(
+    question,
+    null,
+    "요청을 구체적인 조사 단계로 나누고 있습니다.",
+  );
   let progressMessage;
   try {
-    progressMessage = await progressChannel.send({
+    progressMessage = await sourceMessage.reply({
       content: initialContent,
-      allowedMentions: { parse: [] },
+      allowedMentions: { parse: [], repliedUser: false },
+      flags: MessageFlags.SuppressEmbeds,
     });
   } catch (error) {
-    if (createdThread) {
-      try {
-        await progressChannel.setArchived(true, "Could not post Skunor progress message");
-      } catch {
-        // Keep processing the request even if an empty thread cannot be archived.
-      }
-    }
-    log("request_progress_message_failed", {
+    log("request_progress_reply_failed", {
       messageId: sourceMessage.id,
       channelId: sourceMessage.channelId,
       diagnostic: describeCodexError(error),
     });
-    progressChannel = sourceMessage.channel;
-    createdThread = false;
-    try {
-      progressMessage = await sourceMessage.reply({
-        content: initialContent,
-        allowedMentions: { parse: [], repliedUser: false },
-      });
-    } catch (replyError) {
-      log("request_progress_fallback_failed", {
-        messageId: sourceMessage.id,
-        channelId: sourceMessage.channelId,
-        diagnostic: describeCodexError(replyError),
-      });
-      return null;
-    }
+    return null;
   }
 
   let plan = null;
@@ -456,7 +429,7 @@ async function createRequestProgress(sourceMessage, question) {
     renderTimer = setTimeout(() => {
       renderTimer = null;
       renderQueue = renderQueue.then(async () => {
-        const content = renderProgressMessage(plan, activity);
+        const content = renderProgressMessage(question, plan, activity);
         if (content === lastRenderedContent) return;
         try {
           await progressMessage.edit({ content, allowedMentions: { parse: [] } });
@@ -480,7 +453,6 @@ async function createRequestProgress(sourceMessage, question) {
   };
 
   return {
-    channel: progressChannel,
     setPlan(items) {
       const nextPlan = formatProgressPlan(items);
       if (nextPlan.length === 0) return;
@@ -489,8 +461,15 @@ async function createRequestProgress(sourceMessage, question) {
       queueRender();
     },
     setActivity(nextActivity) {
-      if (typeof nextActivity !== "string" || !nextActivity || activity === nextActivity) return;
-      activity = nextActivity;
+      if (nextActivity === null) {
+        if (!plan || activity === null) return;
+        activity = null;
+      } else {
+        if (typeof nextActivity !== "string" || !nextActivity.trim()) return;
+        const normalizedActivity = nextActivity.trim();
+        if (activity === normalizedActivity) return;
+        activity = normalizedActivity;
+      }
       queueRender();
     },
     async finish() {
@@ -510,17 +489,6 @@ async function createRequestProgress(sourceMessage, question) {
             progressMessageId: progressMessage.id,
             diagnostic: describeCodexError(error),
           });
-        }
-        if (createdThread) {
-          try {
-            await progressChannel.setArchived(true, "Skunor request completed");
-          } catch (error) {
-            log("request_progress_thread_archive_failed", {
-              messageId: sourceMessage.id,
-              channelId: progressChannel.id,
-              diagnostic: describeCodexError(error),
-            });
-          }
         }
       })();
       return finishPromise;
@@ -586,17 +554,13 @@ async function runCodexTurnWithProgress(thread, prompt, progress) {
       } else if (item.type === "agent_message" && event.type === "item.completed") {
         finalResponse = item.text;
       } else if (item.type === "web_search") {
-        progress?.setActivity(event.type === "item.completed"
-          ? "검색 결과를 확인하고 있습니다."
-          : "웹 자료를 찾고 있습니다.");
+        const query = compactProgressText(item.query, 150);
+        const searchStatus = event.type === "item.completed" ? "검색 완료" : "검색 중";
+        progress?.setActivity(query ? `${searchStatus}: ${query}` : `${searchStatus}: 웹 자료`);
       } else if (item.type === "command_execution") {
-        progress?.setActivity(event.type === "item.completed"
-          ? "확인한 자료를 정리하고 있습니다."
-          : "자료를 확인하고 있습니다.");
+        progress?.setActivity(null);
       } else if (item.type === "mcp_tool_call") {
-        progress?.setActivity(event.type === "item.completed"
-          ? "요청에 필요한 작업을 마무리하고 있습니다."
-          : "요청에 필요한 도구를 사용하고 있습니다.");
+        progress?.setActivity(null);
       }
     } else if (event.type === "turn.completed") {
       turnCompleted = true;
@@ -896,7 +860,6 @@ async function processRequest({
       discordContext,
     });
     failureStage = "thread_run";
-    progress?.setActivity("요청을 분석하고 있습니다.");
     const turn = await runCodexTurnWithProgress(thread, currentPrompt, progress);
 
     const answer = prepareDiscordResponse(turn.finalResponse?.trim() || "요청을 처리했지만 답변 텍스트가 비어 있습니다.");
@@ -933,7 +896,7 @@ async function processRequest({
           memory: database.findRelevantMemory(guildId, question, MEMORY_LIMIT),
           discordContext,
         });
-        progress?.setActivity("이전 작업 기록을 복구해 다시 분석하고 있습니다.");
+        progress?.setActivity("이전 Codex 대화를 복구하지 못해 현재 요청을 새 문맥에서 다시 조사하고 있습니다.");
         const turn = await runCodexTurnWithProgress(replacementThread, currentPrompt, progress);
         const answer = prepareDiscordResponse(turn.finalResponse?.trim() || "요청을 처리했지만 답변 텍스트가 비어 있습니다.");
         database.setCodexThreadId(conversationKey, replacementThread.id);
