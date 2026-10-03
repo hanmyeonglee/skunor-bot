@@ -344,8 +344,189 @@ function startTypingIndicator(channel) {
   };
 }
 
+function formatProgressPlan(items) {
+  if (!Array.isArray(items)) return [];
+  return items
+    .filter((item) => item && typeof item.text === "string" && item.text.trim())
+    .slice(0, 6)
+    .map((item) => ({
+      text: Array.from(item.text.replace(/\s+/g, " ").trim()).slice(0, 110).join(""),
+      completed: item.completed === true,
+    }));
+}
+
+function renderProgressMessage(plan, activity) {
+  const steps = plan ?? [];
+  const activeIndex = steps.findIndex((step) => !step.completed);
+  const lines = steps.map((step, index) => {
+    if (step.completed) return `✅ ${step.text}`;
+    if (index === activeIndex) return `🔄 ${step.text}`;
+    return `▫️ ${step.text}`;
+  });
+
+  if (activity) lines.push(`\n현재: ${activity}`);
+
+  if (lines.length === 0) {
+    lines.push(activity ? `⏳ ${activity}` : "⏳ 요청을 대기열에서 기다리고 있습니다.");
+  }
+  const content = ["🔎 **분석 진행 상황**", ...lines].join("\n");
+  return content.length > 1_900 ? `${content.slice(0, 1_870)}…(일부 생략)` : content;
+}
+
+async function createRequestProgress(sourceMessage, question) {
+  let progressChannel = sourceMessage.channel;
+  let createdThread = false;
+
+  if (!(sourceMessage.channel.isThread?.() ?? false)) {
+    try {
+      let thread = sourceMessage.hasThread ? sourceMessage.thread : null;
+      if (!thread && sourceMessage.hasThread) {
+        thread = await sourceMessage.channel.threads.fetch(sourceMessage.id);
+      }
+      if (!thread) {
+        const excerpt = question.replace(/<@!?\d+>/g, "").replace(/\s+/g, " ").trim();
+        const threadName = `스쿠너 작업 · ${Array.from(excerpt || "요청").slice(0, 82).join("")}`;
+        thread = await sourceMessage.startThread({
+          name: threadName,
+          autoArchiveDuration: 1_440,
+        });
+        createdThread = true;
+      }
+      progressChannel = thread;
+    } catch (error) {
+      log("request_progress_thread_failed", {
+        messageId: sourceMessage.id,
+        channelId: sourceMessage.channelId,
+        diagnostic: describeCodexError(error),
+      });
+    }
+  }
+
+  const initialContent = renderProgressMessage(null, "요청을 대기열에서 기다리고 있습니다.");
+  let progressMessage;
+  try {
+    progressMessage = await progressChannel.send({
+      content: initialContent,
+      allowedMentions: { parse: [] },
+    });
+  } catch (error) {
+    if (createdThread) {
+      try {
+        await progressChannel.setArchived(true, "Could not post Skunor progress message");
+      } catch {
+        // Keep processing the request even if an empty thread cannot be archived.
+      }
+    }
+    log("request_progress_message_failed", {
+      messageId: sourceMessage.id,
+      channelId: sourceMessage.channelId,
+      diagnostic: describeCodexError(error),
+    });
+    progressChannel = sourceMessage.channel;
+    createdThread = false;
+    try {
+      progressMessage = await sourceMessage.reply({
+        content: initialContent,
+        allowedMentions: { parse: [], repliedUser: false },
+      });
+    } catch (replyError) {
+      log("request_progress_fallback_failed", {
+        messageId: sourceMessage.id,
+        channelId: sourceMessage.channelId,
+        diagnostic: describeCodexError(replyError),
+      });
+      return null;
+    }
+  }
+
+  let plan = null;
+  let activity = null;
+  let finished = false;
+  let finishPromise = null;
+  let renderTimer = null;
+  let renderQueue = Promise.resolve();
+  let lastRenderedContent = initialContent;
+  const stopTyping = startTypingIndicator(progressChannel);
+
+  const queueRender = () => {
+    if (finished) return;
+    if (renderTimer) clearTimeout(renderTimer);
+    renderTimer = setTimeout(() => {
+      renderTimer = null;
+      renderQueue = renderQueue.then(async () => {
+        const content = renderProgressMessage(plan, activity);
+        if (content === lastRenderedContent) return;
+        try {
+          await progressMessage.edit({ content, allowedMentions: { parse: [] } });
+          lastRenderedContent = content;
+        } catch (error) {
+          log("request_progress_update_failed", {
+            messageId: sourceMessage.id,
+            channelId: progressChannel.id,
+            diagnostic: describeCodexError(error),
+          });
+        }
+      }).catch((error) => {
+        log("request_progress_update_failed", {
+          messageId: sourceMessage.id,
+          channelId: progressChannel.id,
+          diagnostic: describeCodexError(error),
+        });
+      });
+    }, 500);
+    renderTimer.unref?.();
+  };
+
+  return {
+    channel: progressChannel,
+    setPlan(items) {
+      const nextPlan = formatProgressPlan(items);
+      if (nextPlan.length === 0) return;
+      plan = nextPlan;
+      activity = null;
+      queueRender();
+    },
+    setActivity(nextActivity) {
+      if (typeof nextActivity !== "string" || !nextActivity || activity === nextActivity) return;
+      activity = nextActivity;
+      queueRender();
+    },
+    async finish() {
+      if (finishPromise) return finishPromise;
+      finished = true;
+      if (renderTimer) clearTimeout(renderTimer);
+      renderTimer = null;
+      stopTyping();
+      finishPromise = (async () => {
+        await renderQueue;
+        try {
+          await progressMessage.delete();
+        } catch (error) {
+          log("request_progress_delete_failed", {
+            messageId: sourceMessage.id,
+            channelId: progressChannel.id,
+            progressMessageId: progressMessage.id,
+            diagnostic: describeCodexError(error),
+          });
+        }
+        if (createdThread) {
+          try {
+            await progressChannel.setArchived(true, "Skunor request completed");
+          } catch (error) {
+            log("request_progress_thread_archive_failed", {
+              messageId: sourceMessage.id,
+              channelId: progressChannel.id,
+              diagnostic: describeCodexError(error),
+            });
+          }
+        }
+      })();
+      return finishPromise;
+    },
+  };
+}
+
 async function startMessageStatus(message) {
-  const stopTyping = startTypingIndicator(message.channel);
   let loadingReaction = null;
 
   try {
@@ -363,7 +544,6 @@ async function startMessageStatus(message) {
   return async () => {
     if (finished) return;
     finished = true;
-    stopTyping();
 
     if (loadingReaction && client.user) {
       try {
@@ -389,6 +569,47 @@ async function startMessageStatus(message) {
       });
     }
   };
+}
+
+async function runCodexTurnWithProgress(thread, prompt, progress) {
+  const { events } = await thread.runStreamed(prompt);
+  let finalResponse = "";
+  let turnCompleted = false;
+
+  for await (const event of events) {
+    if (event.type === "item.started" || event.type === "item.updated" || event.type === "item.completed") {
+      const { item } = event;
+      if (item.type === "todo_list") {
+        progress?.setPlan(item.items);
+      } else if (item.type === "agent_message" && event.type === "item.completed") {
+        finalResponse = item.text;
+      } else if (item.type === "web_search") {
+        progress?.setActivity(event.type === "item.completed"
+          ? "검색 결과를 확인하고 있습니다."
+          : "웹 자료를 찾고 있습니다.");
+      } else if (item.type === "command_execution") {
+        progress?.setActivity(event.type === "item.completed"
+          ? "확인한 자료를 정리하고 있습니다."
+          : "자료를 확인하고 있습니다.");
+      } else if (item.type === "mcp_tool_call") {
+        progress?.setActivity(event.type === "item.completed"
+          ? "요청에 필요한 작업을 마무리하고 있습니다."
+          : "요청에 필요한 도구를 사용하고 있습니다.");
+      }
+    } else if (event.type === "turn.completed") {
+      turnCompleted = true;
+    } else if (event.type === "turn.failed") {
+      const message = typeof event.error === "string" ? event.error : event.error?.message;
+      throw new Error(message || "Codex 작업이 실패했습니다.");
+    } else if (event.type === "error") {
+      throw new Error(event.message || "Codex 이벤트 스트림이 실패했습니다.");
+    } else if (event.type === "turn.interrupted") {
+      throw new Error("Codex 작업이 중단되었습니다.");
+    }
+  }
+
+  if (!turnCompleted) throw new Error("Codex 작업이 완료 이벤트 없이 종료되었습니다.");
+  return { finalResponse };
 }
 
 function isCodexLoggedIn() {
@@ -596,10 +817,16 @@ async function processRequest({
   question,
   conversationKey,
   guildId,
+  progress = null,
 }) {
+  const reply = async (answer) => {
+    await progress?.finish();
+    await saveReply(conversationKey, sourceMessage, answer);
+  };
+
   if (database.isUsageLimited()) {
     if (!isQuotaRecheckRequest(question)) {
-      await saveReply(conversationKey, sourceMessage, config.exceedMessage);
+      await reply(config.exceedMessage);
       return;
     }
 
@@ -608,12 +835,12 @@ async function processRequest({
     } catch (error) {
       const errorKind = classifyCodexError(error);
       if (errorKind === "not_authenticated") {
-        await saveReply(conversationKey, sourceMessage, LOGIN_REQUIRED_MESSAGE);
+        await reply(LOGIN_REQUIRED_MESSAGE);
         log("codex_login_required", { channelId: sourceMessage.channelId });
       } else if (errorKind === "usage_limited") {
-        await saveReply(conversationKey, sourceMessage, config.exceedMessage);
+        await reply(config.exceedMessage);
       } else {
-        await saveReply(conversationKey, sourceMessage, USER_ERROR_TEXT);
+        await reply(USER_ERROR_TEXT);
         log("quota_recheck_failed", {
           category: errorKind,
           messageId: sourceMessage.id,
@@ -626,7 +853,7 @@ async function processRequest({
 
   if (isQuotaRecheckRequest(question)) {
     const answer = "현재 사용 한도 초과 상태로 기록되어 있지 않습니다.";
-    await saveReply(conversationKey, sourceMessage, answer);
+    await reply(answer);
     return;
   }
 
@@ -667,7 +894,8 @@ async function processRequest({
       discordContext,
     });
     failureStage = "thread_run";
-    const turn = await thread.run(currentPrompt);
+    progress?.setActivity("요청을 분석하고 있습니다.");
+    const turn = await runCodexTurnWithProgress(thread, currentPrompt, progress);
 
     const answer = prepareDiscordResponse(turn.finalResponse?.trim() || "요청을 처리했지만 답변 텍스트가 비어 있습니다.");
 
@@ -675,18 +903,18 @@ async function processRequest({
     database.setCodexThreadId(conversationKey, thread.id);
     database.saveResearchMemory({ guildId, conversationKey, question, answer: answer.historyText });
     failureStage = "discord_reply";
-    await saveReply(conversationKey, sourceMessage, answer);
+    await reply(answer);
     log("request_completed", { channelId: sourceMessage.channelId });
   } catch (error) {
     const errorKind = classifyCodexError(error);
     if (errorKind === "not_authenticated") {
-      await saveReply(conversationKey, sourceMessage, LOGIN_REQUIRED_MESSAGE);
+      await reply(LOGIN_REQUIRED_MESSAGE);
       log("codex_login_required", { channelId: sourceMessage.channelId });
       return;
     }
     if (errorKind === "usage_limited") {
       database.setUsageLimited(true);
-      await saveReply(conversationKey, sourceMessage, config.exceedMessage);
+      await reply(config.exceedMessage);
       log("usage_limit_reached");
       return;
     }
@@ -703,23 +931,24 @@ async function processRequest({
           memory: database.findRelevantMemory(guildId, question, MEMORY_LIMIT),
           discordContext,
         });
-        const turn = await replacementThread.run(currentPrompt);
+        progress?.setActivity("이전 작업 기록을 복구해 다시 분석하고 있습니다.");
+        const turn = await runCodexTurnWithProgress(replacementThread, currentPrompt, progress);
         const answer = prepareDiscordResponse(turn.finalResponse?.trim() || "요청을 처리했지만 답변 텍스트가 비어 있습니다.");
         database.setCodexThreadId(conversationKey, replacementThread.id);
         database.saveResearchMemory({ guildId, conversationKey, question, answer: answer.historyText });
-        await saveReply(conversationKey, sourceMessage, answer);
+        await reply(answer);
         log("request_completed_after_thread_restore", { channelId: sourceMessage.channelId });
         return;
       } catch (retryError) {
         const retryErrorKind = classifyCodexError(retryError);
         if (retryErrorKind === "not_authenticated") {
-          await saveReply(conversationKey, sourceMessage, LOGIN_REQUIRED_MESSAGE);
+          await reply(LOGIN_REQUIRED_MESSAGE);
           log("codex_login_required", { channelId: sourceMessage.channelId });
           return;
         }
         if (retryErrorKind === "usage_limited") {
           database.setUsageLimited(true);
-          await saveReply(conversationKey, sourceMessage, config.exceedMessage);
+          await reply(config.exceedMessage);
           log("usage_limit_reached");
           return;
         }
@@ -728,7 +957,7 @@ async function processRequest({
       }
     }
 
-    await saveReply(conversationKey, sourceMessage, USER_ERROR_TEXT);
+    await reply(USER_ERROR_TEXT);
     log("request_failed", {
       category: failureKind,
       stage: failureStage,
@@ -963,6 +1192,8 @@ async function handleMessage(message) {
   if (!inserted) return;
 
   const finishStatus = await startMessageStatus(message);
+  let progress = null;
+  let stopFallbackTyping = null;
   try {
     if (loginRequested) {
       await saveReply(conversationKey, message, LOGIN_IN_PROGRESS_MESSAGE);
@@ -980,14 +1211,22 @@ async function handleMessage(message) {
       return;
     }
 
+    if (!isQuotaRecheckRequest(question)) {
+      progress = await createRequestProgress(message, question);
+    }
+    if (!progress) stopFallbackTyping = startTypingIndicator(message.channel);
+
     const completion = enqueue(() => processRequest({
       sourceMessage: message,
       question,
       conversationKey,
       guildId: message.guildId,
+      progress,
     }));
     await completion;
   } finally {
+    stopFallbackTyping?.();
+    await progress?.finish();
     await finishStatus();
   }
 }
