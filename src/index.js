@@ -2,7 +2,9 @@ import http from "node:http";
 import { spawn } from "node:child_process";
 import { CronExpressionParser } from "cron-parser";
 import {
+  AttachmentBuilder,
   Client,
+  EmbedBuilder,
   GatewayIntentBits,
   MessageFlags,
   SlashCommandBuilder,
@@ -27,6 +29,8 @@ const LOGIN_REQUIRED_MESSAGE = "Codex 로그인이 필요합니다. `/login` 명
 const LOGIN_IN_PROGRESS_MESSAGE = "Codex 로그인이 진행 중입니다. 완료된 뒤 요청을 다시 멘션해 주세요.";
 const THREAD_HISTORY_LIMIT = 12;
 const MEMORY_LIMIT = 4;
+const MAX_CSV_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+const STRUCTURED_RESPONSE_PATTERN = /(?:^|\r?\n)\[\[SKUNOR_RESPONSE_V1\]\]\s*\r?\n([\s\S]*?)\r?\n\[\[\/SKUNOR_RESPONSE_V1\]\](?=\r?\n|$)/;
 
 const config = loadConfig();
 ensureCodexHomeConfig(config.codexHome);
@@ -103,21 +107,190 @@ function splitForDiscord(text, maxLength) {
   return parts.length > 0 ? parts : ["(빈 답변)"];
 }
 
-async function postAnswer(sourceMessage, answer) {
-  const boundedAnswer = boundAnswer(answer);
-  const chunks = splitForDiscord(boundedAnswer, config.maxDiscordMessageChars);
-  const sendOptions = { allowedMentions: { parse: [] } };
+function plainDiscordResponse(content) {
+  const boundedContent = boundAnswer(content || "(빈 답변)");
+  return {
+    kind: "prepared_discord_response",
+    content: boundedContent,
+    embed: null,
+    csv: null,
+    historyText: boundedContent,
+  };
+}
 
-  await sourceMessage.reply({
-    content: chunks[0],
-    allowedMentions: { parse: [], repliedUser: false },
-  });
+function flattenEmbedForHistory(embed) {
+  return [
+    embed.title,
+    embed.description,
+    ...embed.fields.map(({ name, value }) => `**${name}**\n${value}`),
+  ].filter(Boolean).join("\n\n");
+}
 
-  for (const chunk of chunks.slice(1)) {
-    await sourceMessage.channel.send({ content: chunk, ...sendOptions });
+function sanitizeCsvFilename(filename) {
+  let safeFilename = String(filename || "table.csv")
+    .replace(/[\\/:\u0000-\u001f\u007f]/g, "_")
+    .trim()
+    .slice(0, 120);
+  if (!safeFilename) safeFilename = "table.csv";
+  if (!safeFilename.toLowerCase().endsWith(".csv")) safeFilename += ".csv";
+  return safeFilename;
+}
+
+function validateEmbedPayload(embed) {
+  if (!embed || typeof embed !== "object" || Array.isArray(embed)) return null;
+  const title = embed.title ?? "";
+  const description = embed.description ?? "";
+  const rawFields = embed.fields ?? [];
+  if (typeof title !== "string" || typeof description !== "string" || !Array.isArray(rawFields)) return null;
+
+  const fields = [];
+  for (const field of rawFields) {
+    if (!field || typeof field !== "object" || Array.isArray(field)) return null;
+    if (typeof field.name !== "string" || typeof field.value !== "string") return null;
+    if (!field.name.trim() || !field.value.trim()) return null;
+    fields.push({
+      name: field.name,
+      value: field.value,
+      inline: field.inline === true,
+    });
   }
 
-  return boundedAnswer;
+  const characterCount = title.length + description.length
+    + fields.reduce((sum, field) => sum + field.name.length + field.value.length, 0);
+  if (title.length > 256 || description.length > 4_096 || fields.length > 25
+    || fields.some((field) => field.name.length > 256 || field.value.length > 1_024)
+    || characterCount > 6_000
+    || (!title && !description && fields.length === 0)) {
+    return null;
+  }
+
+  return { title, description, fields };
+}
+
+function makePreparedDiscordResponse({ content, embed = null, csv = null }) {
+  const boundedContent = boundAnswer(content || "");
+  const embedText = embed ? flattenEmbedForHistory(embed) : "";
+  const csvText = csv ? `CSV 첨부: ${csv.filename}` : "";
+  const historyText = boundAnswer([boundedContent, embedText, csvText].filter(Boolean).join("\n\n"));
+  return {
+    kind: "prepared_discord_response",
+    content: boundedContent,
+    embed,
+    csv,
+    historyText,
+  };
+}
+
+function prepareDiscordResponse(answer) {
+  if (answer?.kind === "prepared_discord_response") return answer;
+  const rawAnswer = typeof answer === "string" ? answer : String(answer ?? "");
+  const safeAnswer = rawAnswer.replaceAll(config.discordToken, "[Discord bot token redacted]");
+  const match = safeAnswer.match(STRUCTURED_RESPONSE_PATTERN);
+  if (!match) return plainDiscordResponse(safeAnswer);
+  const surroundingText = [
+    safeAnswer.slice(0, match.index),
+    safeAnswer.slice(match.index + match[0].length),
+  ].join("").trim();
+
+  let payload;
+  try {
+    payload = JSON.parse(match[1]);
+  } catch {
+    return plainDiscordResponse("표 응답을 처리하지 못했습니다. 표 내용을 목록 형식으로 다시 요청해 주세요.");
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return plainDiscordResponse("표 응답을 처리하지 못했습니다. 표 내용을 목록 형식으로 다시 요청해 주세요.");
+  }
+
+  const content = [
+    surroundingText,
+    typeof payload.content === "string" ? payload.content : "",
+  ].filter(Boolean).join("\n\n");
+  const hasEmbed = payload.embed !== undefined && payload.embed !== null;
+  const hasCsv = payload.csv !== undefined && payload.csv !== null;
+  if (hasEmbed && hasCsv) {
+    return plainDiscordResponse(`${content}\n\nEmbed와 CSV를 함께 표시할 수 없어 응답을 목록 형식으로 다시 요청해 주세요.`.trim());
+  }
+
+  if (hasEmbed) {
+    const embed = validateEmbedPayload(payload.embed);
+    if (!embed) {
+      const rawFields = Array.isArray(payload.embed?.fields) ? payload.embed.fields : [];
+      const fallbackRows = rawFields
+        .filter((field) => field && typeof field.name === "string" && typeof field.value === "string")
+        .map((field) => `**${field.name}**\n${field.value}`);
+      return plainDiscordResponse([
+        content,
+        payload.embed?.title,
+        payload.embed?.description,
+        ...fallbackRows,
+        "Embed 제한을 넘어 표를 목록 형태로 바꾸었습니다.",
+      ].filter(Boolean).join("\n\n"));
+    }
+    return makePreparedDiscordResponse({ content, embed });
+  }
+
+  if (hasCsv) {
+    if (!payload.csv || typeof payload.csv !== "object" || Array.isArray(payload.csv)
+      || typeof payload.csv.content !== "string" || !payload.csv.content.trim()) {
+      return plainDiscordResponse(`${content}\n\nCSV 첨부를 만들지 못했습니다.`.trim());
+    }
+    const csv = {
+      filename: sanitizeCsvFilename(payload.csv.filename),
+      content: payload.csv.content.replaceAll(config.discordToken, "[Discord bot token redacted]"),
+    };
+    if (Buffer.byteLength(csv.content, "utf8") > MAX_CSV_ATTACHMENT_BYTES) {
+      return plainDiscordResponse(`${content}\n\nCSV 파일이 8 MiB 제한을 넘어 첨부하지 못했습니다.`.trim());
+    }
+    return makePreparedDiscordResponse({
+      content: content || "표 데이터는 CSV 파일로 첨부했습니다.",
+      csv,
+    });
+  }
+
+  return plainDiscordResponse(content);
+}
+
+function toDiscordEmbed(embed) {
+  const builder = new EmbedBuilder();
+  if (embed.title) builder.setTitle(embed.title);
+  if (embed.description) builder.setDescription(embed.description);
+  if (embed.fields.length > 0) builder.addFields(...embed.fields);
+  return builder;
+}
+
+function responseSendOptions(response, content, allowedMentions) {
+  const options = { allowedMentions };
+  if (content) options.content = content;
+  if (response.embed) options.embeds = [toDiscordEmbed(response.embed)];
+  if (response.csv) {
+    options.files = [new AttachmentBuilder(Buffer.from(response.csv.content, "utf8"), {
+      name: response.csv.filename,
+    })];
+  }
+  return options;
+}
+
+async function postAnswer(sourceMessage, answer) {
+  const response = prepareDiscordResponse(answer);
+  const chunks = response.content
+    ? splitForDiscord(response.content, config.maxDiscordMessageChars)
+    : [];
+
+  await sourceMessage.reply(responseSendOptions(
+    response,
+    chunks[0],
+    { parse: [], repliedUser: false },
+  ));
+
+  for (const chunk of chunks.slice(1)) {
+    await sourceMessage.channel.send({
+      content: chunk,
+      allowedMentions: { parse: [] },
+    });
+  }
+
+  return response.historyText;
 }
 
 function enqueue(job) {
@@ -496,11 +669,11 @@ async function processRequest({
     failureStage = "thread_run";
     const turn = await thread.run(currentPrompt);
 
-    const answer = boundAnswer(turn.finalResponse?.trim() || "요청을 처리했지만 답변 텍스트가 비어 있습니다.");
+    const answer = prepareDiscordResponse(turn.finalResponse?.trim() || "요청을 처리했지만 답변 텍스트가 비어 있습니다.");
 
     failureStage = "database_save";
     database.setCodexThreadId(conversationKey, thread.id);
-    database.saveResearchMemory({ guildId, conversationKey, question, answer });
+    database.saveResearchMemory({ guildId, conversationKey, question, answer: answer.historyText });
     failureStage = "discord_reply";
     await saveReply(conversationKey, sourceMessage, answer);
     log("request_completed", { channelId: sourceMessage.channelId });
@@ -531,9 +704,9 @@ async function processRequest({
           discordContext,
         });
         const turn = await replacementThread.run(currentPrompt);
-        const answer = boundAnswer(turn.finalResponse?.trim() || "요청을 처리했지만 답변 텍스트가 비어 있습니다.");
+        const answer = prepareDiscordResponse(turn.finalResponse?.trim() || "요청을 처리했지만 답변 텍스트가 비어 있습니다.");
         database.setCodexThreadId(conversationKey, replacementThread.id);
-        database.saveResearchMemory({ guildId, conversationKey, question, answer });
+        database.saveResearchMemory({ guildId, conversationKey, question, answer: answer.historyText });
         await saveReply(conversationKey, sourceMessage, answer);
         log("request_completed_after_thread_restore", { channelId: sourceMessage.channelId });
         return;
@@ -589,16 +762,21 @@ async function sendScheduleNotification(schedule, content) {
   }
 
   const mention = `<@${schedule.owner_user_id}>`;
-  const chunks = splitForDiscord(boundAnswer(content), config.maxDiscordMessageChars);
-  chunks[0] = `${mention}\n${chunks[0]}`;
-  for (const [index, chunk] of chunks.entries()) {
-    await channel.send({
-      content: chunk,
-      allowedMentions: index === 0
-        ? { parse: [], users: [schedule.owner_user_id] }
-        : { parse: [] },
-    });
+  const response = prepareDiscordResponse(content);
+  const chunks = response.content
+    ? splitForDiscord(response.content, config.maxDiscordMessageChars)
+    : [];
+  const firstContent = chunks.length > 0 ? `${mention}\n${chunks[0]}` : mention;
+  await channel.send(responseSendOptions(
+    response,
+    firstContent,
+    { parse: [], users: [schedule.owner_user_id] },
+  ));
+
+  for (const chunk of chunks.slice(1)) {
+    await channel.send({ content: chunk, allowedMentions: { parse: [] } });
   }
+  return response.historyText;
 }
 
 async function executeScheduleOccurrence(occurrence) {
@@ -661,9 +839,9 @@ async function executeScheduleOccurrence(occurrence) {
       discordContext,
     });
     const turn = await thread.run(prompt);
-    const answer = boundAnswer(turn.finalResponse?.trim() || "예약 작업을 수행했지만 답변 텍스트가 비어 있습니다.");
+    const answer = prepareDiscordResponse(turn.finalResponse?.trim() || "예약 작업을 수행했지만 답변 텍스트가 비어 있습니다.");
     await sendScheduleNotification(occurrence, answer);
-    database.finishScheduleOccurrence({ id: occurrence.id, status: "succeeded", result: answer });
+    database.finishScheduleOccurrence({ id: occurrence.id, status: "succeeded", result: answer.historyText });
     log("schedule_task_completed", { scheduleId: occurrence.schedule_id, channelId: occurrence.channel_id });
   } catch (error) {
     const errorKind = classifyCodexError(error);
