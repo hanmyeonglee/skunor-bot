@@ -261,6 +261,7 @@ function toDiscordEmbed(embed) {
 
 function responseSendOptions(response, content, allowedMentions) {
   const options = { allowedMentions };
+  if (!response.embed) options.flags = MessageFlags.SuppressEmbeds;
   if (content) options.content = content;
   if (response.embed) options.embeds = [toDiscordEmbed(response.embed)];
   if (response.csv) {
@@ -287,6 +288,7 @@ async function postAnswer(sourceMessage, answer) {
     await sourceMessage.channel.send({
       content: chunk,
       allowedMentions: { parse: [] },
+      flags: MessageFlags.SuppressEmbeds,
     });
   }
 
@@ -1003,7 +1005,11 @@ async function sendScheduleNotification(schedule, content) {
   ));
 
   for (const chunk of chunks.slice(1)) {
-    await channel.send({ content: chunk, allowedMentions: { parse: [] } });
+    await channel.send({
+      content: chunk,
+      allowedMentions: { parse: [] },
+      flags: MessageFlags.SuppressEmbeds,
+    });
   }
   return response.historyText;
 }
