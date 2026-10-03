@@ -28,6 +28,9 @@ const USER_ERROR_TEXT = "요청을 처리하지 못했습니다. 잠시 후 다�
 const LOGIN_REQUIRED_MESSAGE = "Codex 로그인이 필요합니다. `/login` 명령어로 이 봇의 Codex 계정을 인증한 뒤 요청을 다시 멘션해 주세요.";
 const LOGIN_IN_PROGRESS_MESSAGE = "Codex 로그인이 진행 중입니다. 완료된 뒤 요청을 다시 멘션해 주세요.";
 const THREAD_HISTORY_LIMIT = 12;
+const QNA_CONTEXT_FETCH_LIMIT = 50;
+const QNA_CONTEXT_MESSAGE_LIMIT = 12;
+const QNA_QUESTION_MAX_CHARS = 1_800;
 const MEMORY_LIMIT = 4;
 const MAX_CSV_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 const STRUCTURED_RESPONSE_PATTERN = /(?:^|\r?\n)\[\[SKUNOR_RESPONSE_V1\]\]\s*\r?\n([\s\S]*?)\r?\n\[\[\/SKUNOR_RESPONSE_V1\]\](?=\r?\n|$)/;
@@ -75,13 +78,16 @@ function createConversationKey(message) {
   return `${message.guildId}:${message.channelId}:${authorPart}`;
 }
 
-function createCodexForMessage(message, { allowScheduleWrites = true } = {}) {
+function createCodexForMessage(message, {
+  allowScheduleWrites = true,
+  requesterUserId = message.author.id,
+} = {}) {
   return createCodexClient({
     codexHome: config.codexHome,
     discordToken: config.discordToken,
     guildId: config.allowedGuildId,
     channelId: message.channelId,
-    requesterUserId: message.author.id,
+    requesterUserId,
     databasePath: config.databasePath,
     timezone: config.scheduleTimezone,
     allowScheduleWrites,
@@ -764,8 +770,11 @@ function boundAnswer(answer) {
   return `${safeAnswer.slice(0, config.maxResponseChars - suffix.length)}${suffix}`;
 }
 
-async function processQuotaRecheck(conversationKey, sourceMessage) {
-  const codex = createCodexForMessage(sourceMessage, { allowScheduleWrites: false });
+async function processQuotaRecheck(conversationKey, sourceMessage, requesterUserId = sourceMessage.author.id) {
+  const codex = createCodexForMessage(sourceMessage, {
+    allowScheduleWrites: false,
+    requesterUserId,
+  });
   const probe = codex.startThread(codexThreadOptions);
   await probe.run([
     "Check whether you can answer with the current Codex account.",
@@ -784,6 +793,8 @@ async function processRequest({
   conversationKey,
   guildId,
   progress = null,
+  requesterUserId = sourceMessage.author.id,
+  initialHistory = [],
 }) {
   const reply = async (answer) => {
     await progress?.finish();
@@ -797,7 +808,7 @@ async function processRequest({
     }
 
     try {
-      await processQuotaRecheck(conversationKey, sourceMessage);
+      await processQuotaRecheck(conversationKey, sourceMessage, requesterUserId);
     } catch (error) {
       const errorKind = classifyCodexError(error);
       if (errorKind === "not_authenticated") {
@@ -832,7 +843,7 @@ async function processRequest({
     guildId: sourceMessage.guildId,
     channelId: sourceMessage.channelId,
     isThread: sourceMessage.channel?.isThread?.() ?? false,
-    requesterUserId: sourceMessage.author.id,
+    requesterUserId,
     timezone: config.scheduleTimezone,
     currentTimeUtc: requestTime.toISOString(),
     currentTimeLocal: new Intl.DateTimeFormat("ko-KR", {
@@ -842,7 +853,7 @@ async function processRequest({
     }).format(requestTime),
   };
   try {
-    codex = createCodexForMessage(sourceMessage);
+    codex = createCodexForMessage(sourceMessage, { requesterUserId });
     const conversation = database.getConversation(conversationKey);
     failureStage = "memory_lookup";
     const memory = database.findRelevantMemory(guildId, question, MEMORY_LIMIT);
@@ -855,7 +866,8 @@ async function processRequest({
       question,
       history: conversation.codex_thread_id
         ? []
-        : database.getRecentHistory(conversationKey, sourceMessage.id, THREAD_HISTORY_LIMIT),
+        : [...initialHistory, ...database.getRecentHistory(conversationKey, sourceMessage.id, THREAD_HISTORY_LIMIT)]
+          .slice(-THREAD_HISTORY_LIMIT),
       memory,
       discordContext,
     });
@@ -892,7 +904,8 @@ async function processRequest({
         const replacementThread = codex.startThread(codexThreadOptions);
         currentPrompt = buildCodexPrompt({
           question,
-          history: database.getRecentHistory(conversationKey, sourceMessage.id, THREAD_HISTORY_LIMIT),
+          history: [...initialHistory, ...database.getRecentHistory(conversationKey, sourceMessage.id, THREAD_HISTORY_LIMIT)]
+            .slice(-THREAD_HISTORY_LIMIT),
           memory: database.findRelevantMemory(guildId, question, MEMORY_LIMIT),
           discordContext,
         });
@@ -1131,9 +1144,221 @@ function pollSchedules() {
   }
 }
 
+async function loadQnaChannelContext(channel, beforeTimestamp) {
+  const fetched = await channel.messages.fetch({ limit: QNA_CONTEXT_FETCH_LIMIT });
+  const recentMessages = [...fetched.values()]
+    .filter((message) => message.createdTimestamp <= beforeTimestamp)
+    .filter((message) => message.content.trim())
+    .filter((message) => !message.author.bot || message.author.id === client.user?.id)
+    .filter((message) => !message.content.startsWith("🔎 **분석 진행 상황**"))
+    .sort((first, second) => first.createdTimestamp - second.createdTimestamp);
+
+  const latestHumanMessage = [...recentMessages]
+    .reverse()
+    .find((message) => !message.author.bot) ?? null;
+  const anchor = latestHumanMessage && !latestHumanMessage.hasThread
+    ? latestHumanMessage
+    : null;
+  const history = recentMessages.slice(-QNA_CONTEXT_MESSAGE_LIMIT).map((message) => {
+    const displayName = message.member?.displayName
+      || message.author.globalName
+      || message.author.username;
+    const content = message.author.bot
+      ? message.content
+      : cleanRequestContent(message.content, client.user.id);
+    return {
+      role: message.author.bot ? "assistant" : "user",
+      content: `${displayName}: ${compactProgressText(content, 1_400)}`,
+    };
+  });
+
+  return { anchor, history };
+}
+
+async function processInitialQnaRequest({
+  sourceMessage,
+  question,
+  conversationKey,
+  guildId,
+  requesterUserId,
+  initialHistory,
+}) {
+  let progress = null;
+  let stopFallbackTyping = null;
+  try {
+    if (loginRequested) {
+      await saveReply(conversationKey, sourceMessage, LOGIN_IN_PROGRESS_MESSAGE);
+      return;
+    }
+
+    if (!(await isCodexLoggedIn())) {
+      await saveReply(conversationKey, sourceMessage, LOGIN_REQUIRED_MESSAGE);
+      log("codex_login_required", { channelId: sourceMessage.channelId });
+      return;
+    }
+
+    if (database.isUsageLimited() && !isQuotaRecheckRequest(question)) {
+      await saveReply(conversationKey, sourceMessage, config.exceedMessage);
+      return;
+    }
+
+    if (!isQuotaRecheckRequest(question)) {
+      progress = await createRequestProgress(sourceMessage, question);
+    }
+    if (!progress) stopFallbackTyping = startTypingIndicator(sourceMessage.channel);
+
+    await processRequest({
+      sourceMessage,
+      question,
+      conversationKey,
+      guildId,
+      requesterUserId,
+      initialHistory,
+      progress,
+    });
+  } finally {
+    stopFallbackTyping?.();
+    await progress?.finish();
+  }
+}
+
+async function handleQnaCommand(interaction) {
+  if (!interaction.isChatInputCommand() || interaction.commandName !== "qna") return;
+  if (interaction.guildId !== config.allowedGuildId) {
+    await interaction.reply({
+      content: "이 서버에서는 Q&A 명령을 사용할 수 없습니다.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  if (interaction.channel?.isThread?.()) {
+    await interaction.editReply("새 Q&A는 일반 채널에서 시작해 주세요. 기존 Q&A 스레드에서는 메시지를 바로 보내 이어서 질문할 수 있습니다.");
+    return;
+  }
+
+  const question = interaction.options.getString("question", true).trim();
+  if (!question) {
+    await interaction.editReply("질문 내용을 입력해 주세요.");
+    return;
+  }
+
+  let thread = null;
+  let createdAnchor = null;
+  try {
+    const { anchor: recentConversationMessage, history } = await loadQnaChannelContext(
+      interaction.channel,
+      interaction.createdTimestamp,
+    );
+    let threadAnchor = recentConversationMessage;
+    if (!threadAnchor) {
+      createdAnchor = await interaction.channel.send({
+        content: "Q&A 요청 스레드",
+        allowedMentions: { parse: [] },
+      });
+      threadAnchor = createdAnchor;
+    }
+
+    const threadName = `Q&A · ${compactProgressText(question, 88)}`;
+    thread = await threadAnchor.startThread(
+      {
+        name: threadName,
+        reason: `Q&A requested by ${interaction.user.id}`,
+      },
+    );
+    const displayName = interaction.member?.displayName
+      || interaction.user.globalName
+      || interaction.user.username;
+    const sourceMessage = await thread.send({
+      content: `**${displayName}의 질문:**\n${question}`,
+      allowedMentions: { parse: [] },
+    });
+    const conversationKey = `${interaction.guildId}:${thread.id}:shared`;
+
+    database.registerQnaThread({
+      threadId: thread.id,
+      guildId: interaction.guildId,
+      parentChannelId: interaction.channelId,
+      ownerUserId: interaction.user.id,
+    });
+    database.ensureConversation({
+      conversationKey,
+      guildId: interaction.guildId,
+      channelId: thread.id,
+      ownerUserId: null,
+    });
+    for (const contextMessage of history) {
+      database.addContextMessage(conversationKey, contextMessage);
+    }
+    database.addUserMessage({
+      conversationKey,
+      discordMessageId: sourceMessage.id,
+      userId: interaction.user.id,
+      content: question,
+    });
+
+    const completion = enqueue(() => processInitialQnaRequest({
+      sourceMessage,
+      question,
+      conversationKey,
+      guildId: interaction.guildId,
+      requesterUserId: interaction.user.id,
+      initialHistory: [],
+    }));
+    void completion.catch((error) => {
+      log("qna_request_failed", {
+        threadId: thread.id,
+        channelId: interaction.channelId,
+        diagnostic: describeCodexError(error),
+      });
+    });
+
+    log("qna_thread_created", {
+      guildId: interaction.guildId,
+      parentChannelId: interaction.channelId,
+      threadId: thread.id,
+      requesterUserId: interaction.user.id,
+      contextMessageCount: history.length,
+    });
+    try {
+      await interaction.editReply(`Q&A 스레드를 열었습니다: <#${thread.id}>`);
+    } catch (error) {
+      log("qna_interaction_ack_failed", {
+        threadId: thread.id,
+        diagnostic: describeCodexError(error),
+      });
+    }
+  } catch (error) {
+    if (thread) {
+      try {
+        await thread.setArchived(true);
+      } catch {
+        // Keep the original setup error for diagnostics.
+      }
+    }
+    if (createdAnchor) {
+      try {
+        await createdAnchor.delete();
+      } catch {
+        // A visible fallback anchor is harmless if Discord rejects deletion.
+      }
+    }
+    log("qna_thread_creation_failed", {
+      guildId: interaction.guildId,
+      channelId: interaction.channelId,
+      diagnostic: describeCodexError(error),
+    });
+    await interaction.editReply("Q&A 스레드를 준비하지 못했습니다. 봇의 채널 기록 및 스레드 권한을 확인한 뒤 다시 시도해 주세요.");
+  }
+}
+
 async function handleMessage(message) {
   if (!message.guildId || message.guildId !== config.allowedGuildId) return;
-  if (message.author.bot || !client.user || !message.mentions.users.has(client.user.id)) return;
+  if (message.author.bot || !client.user) return;
+  const isQnaThread = message.channel.isThread?.()
+    && database.isQnaThread(message.channelId, message.guildId);
+  if (!isQnaThread && !message.mentions.users.has(client.user.id)) return;
 
   const question = cleanRequestContent(message.content, client.user.id);
   const conversationKey = createConversationKey(message);
@@ -1239,6 +1464,18 @@ async function main() {
           .toJSON(),
         config.allowedGuildId,
       );
+      await client.application.commands.create(
+        new SlashCommandBuilder()
+          .setName("qna")
+          .setDescription("최근 대화를 바탕으로 답변하는 Q&A 스레드를 엽니다.")
+          .addStringOption((option) => option
+            .setName("question")
+            .setDescription("최근 대화에 대해 궁금한 점")
+            .setRequired(true)
+            .setMaxLength(QNA_QUESTION_MAX_CHARS))
+          .toJSON(),
+        config.allowedGuildId,
+      );
       log("discord_commands_registered", { guildId: config.allowedGuildId });
     } catch {
       log("discord_commands_registration_failed");
@@ -1254,6 +1491,13 @@ async function main() {
     });
   });
   client.on("interactionCreate", (interaction) => {
+    if (interaction.isChatInputCommand() && interaction.commandName === "qna") {
+      void handleQnaCommand(interaction).catch((error) => {
+        log("qna_interaction_failed", { diagnostic: describeCodexError(error) });
+      });
+      return;
+    }
+
     void handleLoginCommand(interaction).catch((error) => {
       log("login_interaction_failed", { diagnostic: describeCodexError(error) });
     });

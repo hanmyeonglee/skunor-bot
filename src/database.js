@@ -70,6 +70,14 @@ export class BotDatabase {
         created_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS qna_threads (
+        thread_id TEXT PRIMARY KEY,
+        guild_id TEXT NOT NULL,
+        parent_channel_id TEXT NOT NULL,
+        owner_user_id TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS messages_conversation_time
         ON messages(conversation_key, id DESC);
 
@@ -164,8 +172,20 @@ export class BotDatabase {
           conversation_key, user_id, role, content, created_at
         ) VALUES (@conversationKey, NULL, 'assistant', @content, @now)
       `),
+      insertContextMessage: this.db.prepare(`
+        INSERT INTO messages (conversation_key, role, content, created_at)
+        VALUES (@conversationKey, @role, @content, @now)
+      `),
       getConversation: this.db.prepare(`
         SELECT * FROM conversations WHERE conversation_key = ?
+      `),
+      insertQnaThread: this.db.prepare(`
+        INSERT OR IGNORE INTO qna_threads (
+          thread_id, guild_id, parent_channel_id, owner_user_id, created_at
+        ) VALUES (@threadId, @guildId, @parentChannelId, @ownerUserId, @now)
+      `),
+      getQnaThread: this.db.prepare(`
+        SELECT guild_id FROM qna_threads WHERE thread_id = ?
       `),
       setThreadId: this.db.prepare(`
         UPDATE conversations SET codex_thread_id = @threadId, updated_at = @now
@@ -429,8 +449,28 @@ export class BotDatabase {
     this.statements.insertAssistantMessage.run({ conversationKey, content, now: now() });
   }
 
+  addContextMessage(conversationKey, { role, content }) {
+    if (role !== "user" && role !== "assistant") throw new Error("Invalid context message role");
+    this.statements.insertContextMessage.run({ conversationKey, role, content, now: now() });
+  }
+
   getConversation(conversationKey) {
     return this.statements.getConversation.get(conversationKey);
+  }
+
+  registerQnaThread({ threadId, guildId, parentChannelId, ownerUserId }) {
+    this.statements.insertQnaThread.run({
+      threadId,
+      guildId,
+      parentChannelId,
+      ownerUserId,
+      now: now(),
+    });
+  }
+
+  isQnaThread(threadId, guildId) {
+    const thread = this.statements.getQnaThread.get(threadId);
+    return Boolean(thread && thread.guild_id === guildId);
   }
 
   setCodexThreadId(conversationKey, threadId) {

@@ -5,7 +5,7 @@
 ## 동작
 
 - `ALLOWED_GUILD_ID`에 적은 서버에서만 작동합니다. 별도의 사용자 인증이나 사용자별 허용 목록은 두지 않습니다.
-- 봇을 멘션한 메시지만 처리합니다. 요청은 한 번에 하나씩 처리하고, Discord 메시지 길이에 맞춰 답변을 나눕니다.
+- 일반 채널에서는 봇을 멘션한 메시지를 처리합니다. `/qna question:<질문>`을 실행하면 최근 대화에 연결된 새 공개 스레드를 만들고, 최근 메시지 최대 12개를 문맥으로 사용해 첫 답변을 그 스레드에 보냅니다. Q&A 스레드에서는 멘션 없이 보낸 모든 사람 메시지에 답하며, 스레드와 대화 내용은 SQLite에 저장됩니다. 요청은 한 번에 하나씩 처리하고, Discord 메시지 길이에 맞춰 답변을 나눕니다.
 - Discord에서 지원하지 않는 마크다운 표 대신 제목·목록 형식으로 답합니다. 표가 비교에 유리하고 작으면 Embed 필드에 항목별 카드로 표시하며, Embed에 담기 어려운 표는 UTF-8 CSV 파일로 첨부합니다. CSV 첨부는 최대 8 MiB입니다.
 - Codex 로그인이 안 되어 있으면 요청을 실행하지 않고 `/login` 명령을 안내합니다. `/login`은 기기 코드 인증 정보를 명령 실행자에게만 비공개로 보여줍니다. 인증 후 원래 요청을 다시 멘션해야 합니다.
 - Codex 설정은 `gpt-6-luna`, 추론 `max`, 서비스 등급 `fast`로 고정되어 있습니다.
@@ -24,7 +24,7 @@
 ## Discord 설정
 
 1. Discord Developer Portal에서 애플리케이션과 Bot을 만듭니다.
-2. OAuth2 URL Generator에서 `bot` scope와 `View Channels`, `Send Messages`, `Read Message History`, `Add Reactions` 권한을 골라 비공개 서버에 초대합니다. `bot` scope에 슬래시 명령용 `applications.commands` scope가 포함됩니다. 기록을 읽을 대상 채널에도 봇 역할의 `View Channel`과 `Read Message History` 권한이 있어야 합니다.
+2. OAuth2 URL Generator에서 `bot` scope와 `View Channels`, `Send Messages`, `Read Message History`, `Add Reactions`, `Create Public Threads`, `Send Messages in Threads` 권한을 골라 비공개 서버에 초대합니다. `bot` scope에 슬래시 명령용 `applications.commands` scope가 포함됩니다. 기록을 읽을 대상 채널에도 봇 역할의 `View Channel`과 `Read Message History` 권한이 있어야 합니다.
 3. `.env.example`을 `.env`로 복사하고 `DISCORD_TOKEN`, `ALLOWED_GUILD_ID`를 채웁니다.
 
 Discord Developer Portal에서 애플리케이션의 **Bot → Privileged Gateway Intents → Message Content Intent**를 켜고 저장하세요. 봇은 요청으로 지정된 다른 채널의 메시지 본문을 읽고 검색하기 위해 이 intent가 필요합니다. 코드에서도 `GatewayIntentBits.MessageContent`를 요청합니다. 변경 후 컨테이너를 재시작하세요.
