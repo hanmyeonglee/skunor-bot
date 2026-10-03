@@ -27,12 +27,17 @@ const MEMORY_LIMIT = 4;
 
 const config = loadConfig();
 const database = new BotDatabase(config.databasePath);
-const codex = createCodexClient({ codexHome: config.codexHome });
+const codex = createCodexClient({
+  codexHome: config.codexHome,
+  discordToken: config.discordToken,
+  guildId: config.allowedGuildId,
+});
 const codexThreadOptions = createThreadOptions();
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
   ],
 });
 
@@ -379,8 +384,9 @@ async function saveReply(conversationKey, sourceMessage, answer) {
 
 function boundAnswer(answer) {
   const suffix = "\n\n(응답이 Discord 전송 한도 때문에 일부 잘렸습니다.)";
-  if (answer.length <= config.maxResponseChars) return answer;
-  return `${answer.slice(0, config.maxResponseChars - suffix.length)}${suffix}`;
+  const safeAnswer = answer.replaceAll(config.discordToken, "[Discord bot token redacted]");
+  if (safeAnswer.length <= config.maxResponseChars) return safeAnswer;
+  return `${safeAnswer.slice(0, config.maxResponseChars - suffix.length)}${suffix}`;
 }
 
 async function processQuotaRecheck(conversationKey, sourceMessage) {
@@ -396,7 +402,12 @@ async function processQuotaRecheck(conversationKey, sourceMessage) {
   log("quota_recheck_succeeded");
 }
 
-async function processRequest({ sourceMessage, question, conversationKey, guildId }) {
+async function processRequest({
+  sourceMessage,
+  question,
+  conversationKey,
+  guildId,
+}) {
   if (database.isUsageLimited()) {
     if (!isQuotaRecheckRequest(question)) {
       await saveReply(conversationKey, sourceMessage, config.exceedMessage);
@@ -433,6 +444,11 @@ async function processRequest({ sourceMessage, question, conversationKey, guildI
   let thread = null;
   let currentPrompt = "";
   let failureStage = "conversation_load";
+  const discordContext = {
+    guildId: sourceMessage.guildId,
+    channelId: sourceMessage.channelId,
+    isThread: sourceMessage.channel?.isThread?.() ?? false,
+  };
   try {
     const conversation = database.getConversation(conversationKey);
     failureStage = "memory_lookup";
@@ -448,6 +464,7 @@ async function processRequest({ sourceMessage, question, conversationKey, guildI
         ? []
         : database.getRecentHistory(conversationKey, sourceMessage.id, THREAD_HISTORY_LIMIT),
       memory,
+      discordContext,
     });
     failureStage = "thread_run";
     const turn = await thread.run(currentPrompt);
@@ -484,6 +501,7 @@ async function processRequest({ sourceMessage, question, conversationKey, guildI
           question,
           history: database.getRecentHistory(conversationKey, sourceMessage.id, THREAD_HISTORY_LIMIT),
           memory: database.findRelevantMemory(guildId, question, MEMORY_LIMIT),
+          discordContext,
         });
         const turn = await replacementThread.run(currentPrompt);
         const answer = boundAnswer(turn.finalResponse?.trim() || "요청을 처리했지만 답변 텍스트가 비어 있습니다.");
@@ -516,7 +534,9 @@ async function processRequest({ sourceMessage, question, conversationKey, guildI
       stage: failureStage,
       messageId: sourceMessage.id,
       channelId: sourceMessage.channelId,
-      diagnostic: describeCodexError(failureError, { redactValues: [question, currentPrompt] }),
+      diagnostic: describeCodexError(failureError, {
+        redactValues: [question, currentPrompt, config.discordToken],
+      }),
     });
   }
 }

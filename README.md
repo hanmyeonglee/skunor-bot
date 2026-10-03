@@ -9,18 +9,22 @@
 - Codex 로그인이 안 되어 있으면 요청을 실행하지 않고 `/login` 명령을 안내합니다. `/login`은 기기 코드 인증 정보를 명령 실행자에게만 비공개로 보여줍니다. 인증 후 원래 요청을 다시 멘션해야 합니다.
 - Codex 설정은 `gpt-6-luna`, 추론 `max`, 서비스 등급 `fast`로 고정되어 있습니다.
 - 한 Discord 스레드 안에서는 참가자들이 대화 맥락을 공유합니다. 일반 채널에서는 사용자별 맥락을 분리합니다.
+- 채널 기록·검색 요청은 설치된 `discord-api` 스킬에 따라 Codex가 Discord API를 직접 호출해 처리합니다. 채널 이름은 서버의 채널 목록에서 찾고, 채널 기록은 최근 100개씩 최대 300개까지 읽습니다. 메시지 검색은 Discord의 색인 검색을 사용하며 페이지마다 최대 25개를 반환합니다.
+- API로 읽은 채널 기록은 SQLite에 복사하지 않습니다. 답변 근거로 사용한 메시지의 Discord 링크를 포함하고, 오래된 기록 전체를 읽지 않았다면 읽은 범위를 밝힙니다. 원문은 Codex 대화 세션에 포함될 수 있습니다.
 - 이전 조사 결과 메모리는 허용된 서버 안에서 공유합니다. 비슷한 과거 질문과 답변을 SQLite에서 찾아 새 요청에 참고 자료로 전달합니다.
 - SQLite에는 멘션으로 들어온 질문, 봇의 답변, Codex 대화 스레드 ID와 조사 메모리가 저장됩니다.
-- Codex에는 Discord 토큰 등 봇 프로세스의 환경 변수를 넘기지 않습니다. Codex 로컬 명령은 읽기 전용으로 제한하고, 인증 정보·DB·앱 디렉터리 읽기를 차단합니다.
+- Discord API 호출을 위해 Codex 요청 프로세스에는 `DISCORD_BOT_TOKEN`과 `DISCORD_GUILD_ID` 환경 변수를 전달합니다. 스킬은 토큰을 인증 헤더에만 사용하고 읽기 전용 GET 요청만 하도록 지시하지만, 이 제한은 컨테이너 내부의 기술적 차단은 아닙니다. Codex는 승인 없이 전체 접근 모드로 실행되므로 `node` 사용자가 접근 가능한 DB, `/data/codex`, 환경 변수에도 접근할 수 있습니다.
 - Codex가 사용량 한도 오류를 반환하면 SQLite에 상태를 저장하고 `EXCEED_MESSAGE`를 보냅니다. 한도 오류만으로 초기화 시각을 알 수 없으므로, 사용량이 돌아온 뒤 `@봇 재확인`을 보내 직접 확인합니다.
 
 ## Discord 설정
 
 1. Discord Developer Portal에서 애플리케이션과 Bot을 만듭니다.
-2. OAuth2 URL Generator에서 `bot` scope와 `View Channels`, `Send Messages`, `Read Message History` 권한을 골라 비공개 서버에 초대합니다. `bot` scope에 슬래시 명령용 `applications.commands` scope가 포함됩니다.
+2. OAuth2 URL Generator에서 `bot` scope와 `View Channels`, `Send Messages`, `Read Message History`, `Add Reactions` 권한을 골라 비공개 서버에 초대합니다. `bot` scope에 슬래시 명령용 `applications.commands` scope가 포함됩니다. 기록을 읽을 대상 채널에도 봇 역할의 `View Channel`과 `Read Message History` 권한이 있어야 합니다.
 3. `.env.example`을 `.env`로 복사하고 `DISCORD_TOKEN`, `ALLOWED_GUILD_ID`를 채웁니다.
 
-이 봇은 멘션된 메시지만 읽으므로 **Message Content Intent**를 켤 필요가 없습니다. Discord는 봇을 멘션한 메시지의 본문을 이 intent 없이도 전달합니다.
+Discord Developer Portal에서 애플리케이션의 **Bot → Privileged Gateway Intents → Message Content Intent**를 켜고 저장하세요. 봇은 요청으로 지정된 다른 채널의 메시지 본문을 읽고 검색하기 위해 이 intent가 필요합니다. 코드에서도 `GatewayIntentBits.MessageContent`를 요청합니다. 변경 후 컨테이너를 재시작하세요.
+
+기록 읽기와 검색은 요청에서 지정한 채널 또는 현재 채널을 대상으로 합니다. Discord 검색 색인이 준비되지 않으면 최근 300개 메시지에서 제한적으로 검색하고 그 범위를 답변에 밝힙니다. API 명세와 curl 예시는 `skills/discord-api/references/api.md`에 있습니다. Discord의 메시지 검색은 `Read Message History` 권한과 Message Content intent의 영향을 받습니다. [메시지 조회·검색 API 문서](https://discord.com/developers/docs/resources/message)
 
 ```sh
 cp .env.example .env
@@ -40,7 +44,7 @@ docker compose logs -f bot
 
 첫 명령은 이미지를 빌드하고, 두 번째 명령은 봇을 상시 실행합니다. 처음 봇을 멘션하면 로그인 안내가 나오며, Discord에서 `/login`을 실행해 표시되는 주소와 코드를 사용해 외부 브라우저에서 Codex 계정을 승인하세요. 인증 상태는 봇 전체가 공유합니다.
 
-`bot-data` Docker 볼륨을 `/data`에 마운트해 SQLite DB, Codex 로그인 정보, Codex 대화를 보존합니다. Codex 요청은 컨테이너 안에서 전체 접근 모드로 실행되므로 Codex 도구도 `/data`를 읽고 쓸 수 있습니다. 볼륨을 백업하고 서버 관리자만 접근하게 하세요. `docker compose down -v`는 이 데이터를 삭제합니다.
+`bot-data` Docker 볼륨을 `/data`에 마운트해 SQLite DB, Codex 로그인 정보, Codex 대화를 보존합니다. 시작할 때 저장소의 `skills/discord-api` 스킬을 `/data/codex/skills/discord-api`에 설치합니다. 실행 이미지에는 스킬의 curl 예시를 위해 `curl`과 `jq`가 포함됩니다. Codex 요청은 컨테이너 안에서 전체 접근 모드로 실행되므로 Codex 도구도 `/data`를 읽고 쓸 수 있습니다. 볼륨을 백업하고 서버 관리자만 접근하게 하세요. `docker compose down -v`는 이 데이터를 삭제합니다.
 
 Compose는 호스트 포트를 공개하지 않습니다. 봇은 Discord Gateway로 직접 연결하고 `0.0.0.0:8080`에 내부 health endpoint만 제공합니다. `/healthz`는 프로세스 liveness, `/readyz`는 Discord 연결 상태를 확인합니다. 공개 도메인이나 reverse proxy는 필요하지 않습니다.
 
@@ -85,4 +89,4 @@ npm install
 npm start
 ```
 
-로컬 실행에서도 Codex CLI 로그인 상태가 필요하며 `CODEX_HOME`의 권한 프로필을 봇이 초기화합니다.
+로컬 실행에서도 Codex CLI 로그인 상태와 `curl`, `jq`가 필요하며 `CODEX_HOME`에 스킬을 설치하고 권한 프로필을 초기화합니다.

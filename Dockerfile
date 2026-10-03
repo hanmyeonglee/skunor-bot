@@ -22,7 +22,7 @@ ENV NODE_ENV=production \
 WORKDIR /app
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates \
+  && apt-get install -y --no-install-recommends ca-certificates curl jq \
   && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /data /workspace \
@@ -31,6 +31,7 @@ RUN mkdir -p /data /workspace \
 COPY --chown=node:node --from=dependencies /app/node_modules ./node_modules
 COPY --chown=node:node package.json ./package.json
 COPY --chown=node:node src ./src
+COPY --chown=node:node skills ./skills
 
 VOLUME ["/data"]
 EXPOSE 8080
