@@ -94,22 +94,133 @@ function createCodexForMessage(message, {
   });
 }
 
-function splitForDiscord(text, maxLength) {
-  const parts = [];
-  let remaining = text;
+function isFenceCloser(line, fence) {
+  if (!fence) return false;
+  const content = line.replace(/\r?\n$/, "");
+  const closing = new RegExp(`^ {0,3}${fence.character}{${fence.length},}[ \\t]*$`);
+  return closing.test(content);
+}
 
-  while (remaining.length > maxLength) {
-    let splitAt = remaining.lastIndexOf("\n", maxLength);
-    if (splitAt < Math.floor(maxLength * 0.55)) {
-      splitAt = remaining.lastIndexOf(" ", maxLength);
-    }
-    if (splitAt < Math.floor(maxLength * 0.55)) splitAt = maxLength;
+function parseFenceLine(line, openFence) {
+  const content = line.replace(/\r?\n$/, "");
+  if (openFence) return isFenceCloser(line, openFence) ? null : openFence;
 
-    parts.push(remaining.slice(0, splitAt).trimEnd());
-    remaining = remaining.slice(splitAt).trimStart();
+  const opening = content.match(/^( {0,3})(`{3,}|~{3,})(.*)$/);
+  if (!opening || (opening[2][0] === "`" && opening[3].includes("`"))) return null;
+  return {
+    character: opening[2][0],
+    length: opening[2].length,
+    openingLine: content,
+    closingLine: `${opening[1]}${opening[2][0].repeat(opening[2].length)}`,
+  };
+}
+
+function splitPoint(value, limit) {
+  const minimum = Math.floor(limit * 0.55);
+  const newlineAt = value.lastIndexOf("\n", limit - 1);
+  if (newlineAt >= minimum) return newlineAt + 1;
+
+  for (let index = limit - 1; index >= minimum; index -= 1) {
+    if (value[index] === "\r" && value[index + 1] === "\n") continue;
+    if (/\s/.test(value[index])) return index + 1;
   }
 
-  if (remaining.length > 0) parts.push(remaining);
+  let point = limit;
+  if (point > 0 && point < value.length) {
+    const previous = value.charCodeAt(point - 1);
+    const next = value.charCodeAt(point);
+    if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
+      point -= 1;
+    }
+  }
+  return Math.max(1, point);
+}
+
+function splitForDiscord(text, maxLength) {
+  const parts = [];
+  const lines = text.match(/[^\n]*\n|[^\n]+$/g) || [];
+  let current = "";
+  let openFence = null;
+
+  const fenceClosing = (fence, content) => {
+    if (!fence) return "";
+    const newline = content.endsWith("\n") || content.endsWith("\r") ? "" : "\n";
+    return `${newline}${fence.closingLine}`;
+  };
+  const maxFenceClosingLength = (fence) => (fence ? fence.closingLine.length + 1 : 0);
+
+  const reopenFence = (fence) => (fence ? `${fence.openingLine}\n` : "");
+
+  const flush = () => {
+    if (!current) return;
+    const part = `${current}${fenceClosing(openFence, current)}`;
+    if (part.length > maxLength) throw new Error("Discord message split exceeded its configured length");
+    parts.push(part);
+    current = reopenFence(openFence);
+  };
+
+  for (const line of lines) {
+    const nextFence = parseFenceLine(line, openFence);
+    if (current.length + line.length + fenceClosing(nextFence, `${current}${line}`).length <= maxLength) {
+      current += line;
+      openFence = nextFence;
+      continue;
+    }
+
+    // A synthetic closer in the previous chunk already represents this source closer.
+    if (openFence && !nextFence && isFenceCloser(line, openFence)) {
+      flush();
+      openFence = null;
+      current = "";
+      continue;
+    }
+
+    if (nextFence === openFence) {
+      let remaining = line;
+      while (remaining.length > 0) {
+        let available = maxLength - current.length - maxFenceClosingLength(openFence);
+        if (available < 1) {
+          flush();
+          available = maxLength - current.length - maxFenceClosingLength(openFence);
+        }
+        const point = remaining.length <= available ? remaining.length : splitPoint(remaining, available);
+        current += remaining.slice(0, point);
+        remaining = remaining.slice(point);
+        if (remaining.length > 0) flush();
+      }
+      continue;
+    }
+
+    flush();
+
+    if (current.length + line.length + fenceClosing(nextFence, `${current}${line}`).length <= maxLength) {
+      current += line;
+      openFence = nextFence;
+      continue;
+    }
+
+    // Fence delimiter lines are short in normal Markdown; split an unusually long one safely.
+    let remaining = line;
+    while (remaining.length > 0) {
+      let available = maxLength - current.length - maxFenceClosingLength(openFence);
+      if (available < 1) {
+        flush();
+        available = maxLength - current.length - maxFenceClosingLength(openFence);
+      }
+      const point = remaining.length <= available ? remaining.length : splitPoint(remaining, available);
+      current += remaining.slice(0, point);
+      remaining = remaining.slice(point);
+      if (remaining.length > 0) flush();
+    }
+    openFence = nextFence;
+  }
+
+  if (current) {
+    const finalPart = `${current}${fenceClosing(openFence, current)}`;
+    if (finalPart.length > maxLength) throw new Error("Discord message split exceeded its configured length");
+    parts.push(finalPart);
+  }
+
   return parts.length > 0 ? parts : ["(빈 답변)"];
 }
 
