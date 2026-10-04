@@ -7,7 +7,7 @@ process.umask(0o077);
 const tools = [
   {
     name: "create_scheduled_task",
-    description: "Create a recurring task. Codex will run taskPrompt on each cron occurrence and send the result to the current Discord channel mentioning the requester. Defaults to a personal schedule and the request timezone.",
+    description: "Create a recurring task. Codex runs taskPrompt on each cron occurrence and sends the result to the configured channel and mention target. Notifications default to the current channel and requester. Visibility defaults to personal and timezone to the request timezone.",
     inputSchema: {
       type: "object",
       properties: {
@@ -16,6 +16,8 @@ const tools = [
         cronExpression: { type: "string", description: "A five-field cron expression: minute hour day-of-month month day-of-week." },
         timezone: { type: "string", description: "IANA timezone, such as Asia/Seoul. Defaults to the request timezone." },
         visibility: { type: "string", enum: ["personal", "shared"], description: "Use shared only when the requester asks for a server-wide schedule; otherwise personal." },
+        notificationChannelId: { type: "string", description: "Optional destination channel ID or exact channel name from trusted Discord request context. Use 'current' for the channel where the request was made. Defaults to current channel." },
+        mentionUserId: { type: "string", description: "Optional mention target ID or exact user name from trusted Discord request context. Use 'self' for the requester. Defaults to mentioning the requester." },
       },
       required: ["title", "taskPrompt", "cronExpression"],
       additionalProperties: false,
@@ -23,7 +25,7 @@ const tools = [
   },
   {
     name: "create_event",
-    description: "Remember a one-time event and notify its registrant in the current Discord channel 15 minutes and 5 minutes before it starts. startsAt must be ISO 8601 with an explicit timezone offset. Defaults to personal visibility and the request timezone.",
+    description: "Remember a one-time event and notify the configured mention target in the configured channel 15 minutes and 5 minutes before it starts. Defaults to the current channel and requester. startsAt must be ISO 8601 with an explicit timezone offset. Defaults to personal visibility and the request timezone.",
     inputSchema: {
       type: "object",
       properties: {
@@ -32,6 +34,8 @@ const tools = [
         details: { type: "string", description: "Optional notes about the event." },
         timezone: { type: "string", description: "IANA timezone used to display and interpret the event, such as Asia/Seoul." },
         visibility: { type: "string", enum: ["personal", "shared"], description: "Use shared only when the requester asks for a server-wide schedule; otherwise personal." },
+        notificationChannelId: { type: "string", description: "Optional destination channel ID or exact channel name from trusted Discord request context. Use 'current' for the channel where the request was made. Defaults to current channel." },
+        mentionUserId: { type: "string", description: "Optional mention target ID or exact user name from trusted Discord request context. Use 'self' for the requester. Defaults to mentioning the requester." },
       },
       required: ["title", "startsAt"],
       additionalProperties: false,
@@ -54,7 +58,7 @@ const tools = [
   },
   {
     name: "update_schedule",
-    description: "Update a schedule created by the current requester. Only its registrant can update it. Supply the schedule ID and only the fields to change. Event reminders remain 15 and 5 minutes before start.",
+    description: "Update a schedule created by the current requester. Only its registrant can update it. Supply the schedule ID and only the fields to change. notificationChannelId can be a channel ID or exact channel name from trusted Discord request context; use 'current' for the request channel. mentionUserId can be a user ID or exact user name from trusted context; use 'self' for the requester. Event reminders remain 15 and 5 minutes before start.",
     inputSchema: {
       type: "object",
       properties: {
@@ -66,6 +70,8 @@ const tools = [
         startsAt: { type: "string", description: "ISO 8601 date and time with Z or an explicit offset; events only." },
         timezone: { type: "string" },
         visibility: { type: "string", enum: ["personal", "shared"] },
+        notificationChannelId: { type: "string", description: "Change the destination. Use a channel from trusted Discord request context or 'current'." },
+        mentionUserId: { type: "string", description: "Change who is pinged. Use a user from trusted Discord request context or 'self'." },
       },
       required: ["scheduleId"],
       additionalProperties: false,
@@ -97,6 +103,64 @@ function getRequestContext() {
   }
   validateTimezone(context.timezone);
   return context;
+}
+
+function getTargetOptions(environmentVariable) {
+  let options;
+  try {
+    options = JSON.parse(process.env[environmentVariable] || "[]");
+  } catch {
+    throw new Error(`${environmentVariable} must contain a JSON array.`);
+  }
+  if (!Array.isArray(options)) throw new Error(`${environmentVariable} must contain a JSON array.`);
+  return options.filter((option) => (
+    option
+    && typeof option.id === "string"
+    && /^\d{17,20}$/u.test(option.id)
+    && typeof option.name === "string"
+    && option.name.trim()
+  ));
+}
+
+function resolveTargetId(value, options, field, { mentionPattern = null, selfId = null } = {}) {
+  const target = cleanText(value, field, 200);
+  if (selfId && target.toLocaleLowerCase("en-US") === "self") return selfId;
+
+  const mentionedId = mentionPattern ? target.match(mentionPattern)?.[1] : null;
+  const query = mentionedId || target.replace(/^[@#]/u, "").trim();
+  const matches = options.filter((option) => (
+    option.id === query
+    || option.name.trim().toLocaleLowerCase("en-US") === query.toLocaleLowerCase("en-US")
+  ));
+  if (matches.length === 1) return matches[0].id;
+  if (matches.length > 1) throw new Error(`${field} matches multiple Discord targets; use an explicit mention.`);
+  throw new Error(`${field} must match an available Discord target in the current request context.`);
+}
+
+function resolveNotificationChannel(value, context) {
+  if (value === undefined) return context.channelId;
+  if (typeof value === "string" && value.trim().toLocaleLowerCase("en-US") === "current") {
+    return context.channelId;
+  }
+  return resolveTargetId(
+    value,
+    getTargetOptions("SCHEDULE_NOTIFICATION_CHANNEL_OPTIONS_JSON"),
+    "notificationChannelId",
+    { mentionPattern: /^<#(\d{17,20})>$/u },
+  );
+}
+
+function resolveMentionUser(value, context) {
+  if (value === undefined) return context.userId;
+  if (typeof value === "string" && value.trim().toLocaleLowerCase("en-US") === "self") {
+    return context.userId;
+  }
+  return resolveTargetId(
+    value,
+    getTargetOptions("SCHEDULE_NOTIFICATION_USER_OPTIONS_JSON"),
+    "mentionUserId",
+    { mentionPattern: /^<@!?(\d{17,20})>$/u, selfId: context.userId },
+  );
 }
 
 function ensureWritesAllowed() {
@@ -171,7 +235,8 @@ function scheduleSummary(schedule) {
     visibility: schedule.visibility,
     status: schedule.status,
     timezone: schedule.timezone,
-    channelId: schedule.channel_id,
+    notificationChannelId: schedule.channel_id,
+    mentionUserId: schedule.mention_user_id ?? schedule.owner_user_id,
     createdAt: schedule.created_at,
     ...(schedule.kind === "event"
       ? { startsAt: schedule.event_at, reminderMinutesBefore: JSON.parse(schedule.reminder_offsets || "[15,5]") }
@@ -199,11 +264,12 @@ function createScheduledTask(args) {
   const schedule = database.createSchedule({
     id: randomUUID(),
     guildId: context.guildId,
-    channelId: context.channelId,
     ownerUserId: context.userId,
     visibility: normalizeVisibility(args.visibility),
     kind: "cron",
     title,
+    channelId: resolveNotificationChannel(args.notificationChannelId, context),
+    mentionUserId: resolveMentionUser(args.mentionUserId, context),
     taskPrompt,
     cronExpression: expression,
     timezone,
@@ -222,11 +288,12 @@ function createEvent(args) {
   const schedule = database.createSchedule({
     id: randomUUID(),
     guildId: context.guildId,
-    channelId: context.channelId,
     ownerUserId: context.userId,
     visibility: normalizeVisibility(args.visibility),
     kind: "event",
     title,
+    channelId: resolveNotificationChannel(args.notificationChannelId, context),
+    mentionUserId: resolveMentionUser(args.mentionUserId, context),
     details,
     eventAt,
     reminderOffsets: [15, 5],
@@ -266,6 +333,12 @@ function updateSchedule(args) {
   if (args.title !== undefined) changes.title = cleanText(args.title, "title", 160);
   if (args.visibility !== undefined) changes.visibility = normalizeVisibility(args.visibility);
   if (args.timezone !== undefined) changes.timezone = validateTimezone(args.timezone);
+  if (args.notificationChannelId !== undefined) {
+    changes.channel_id = resolveNotificationChannel(args.notificationChannelId, context);
+  }
+  if (args.mentionUserId !== undefined) {
+    changes.mention_user_id = resolveMentionUser(args.mentionUserId, context);
+  }
 
   if (existing.kind === "cron") {
     if (args.startsAt !== undefined || args.details !== undefined) {
@@ -341,7 +414,7 @@ function handleRequest(request) {
         protocolVersion: request.params?.protocolVersion || "2024-11-05",
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: "skunor-schedule", version: "1.0.0" },
-        instructions: "Use these tools for personal and shared Discord schedules. Personal schedules are owner-only. Scheduled task runs have schedule writes disabled.",
+        instructions: "Use these tools for personal and shared Discord schedules. Personal schedules are owner-only. Notification channels and mention targets must match the trusted options supplied for the current Discord request. Scheduled task runs have schedule writes disabled.",
       },
     };
   }

@@ -114,6 +114,7 @@ export class BotDatabase {
         guild_id TEXT NOT NULL,
         channel_id TEXT NOT NULL,
         owner_user_id TEXT NOT NULL,
+        mention_user_id TEXT,
         visibility TEXT NOT NULL CHECK (visibility IN ('personal', 'shared')),
         kind TEXT NOT NULL CHECK (kind IN ('cron', 'event')),
         title TEXT NOT NULL,
@@ -152,6 +153,11 @@ export class BotDatabase {
       CREATE INDEX IF NOT EXISTS schedule_occurrences_due
         ON schedule_occurrences(status, scheduled_at);
     `);
+
+    const scheduledItemColumns = this.db.pragma("table_info(scheduled_items)");
+    if (!scheduledItemColumns.some((column) => column.name === "mention_user_id")) {
+      this.db.exec("ALTER TABLE scheduled_items ADD COLUMN mention_user_id TEXT");
+    }
 
     this.statements = {
       createConversation: this.db.prepare(`
@@ -226,11 +232,11 @@ export class BotDatabase {
       deleteState: this.db.prepare("DELETE FROM bot_state WHERE key = ?"),
       insertSchedule: this.db.prepare(`
         INSERT INTO scheduled_items (
-          id, guild_id, channel_id, owner_user_id, visibility, kind, title, details,
+          id, guild_id, channel_id, owner_user_id, mention_user_id, visibility, kind, title, details,
           task_prompt, cron_expression, event_at, reminder_offsets, timezone,
           next_run_at, status, created_at, updated_at
         ) VALUES (
-          @id, @guildId, @channelId, @ownerUserId, @visibility, @kind, @title, @details,
+          @id, @guildId, @channelId, @ownerUserId, @mentionUserId, @visibility, @kind, @title, @details,
           @taskPrompt, @cronExpression, @eventAt, @reminderOffsets, @timezone,
           @nextRunAt, @status, @now, @now
         )
@@ -284,7 +290,7 @@ export class BotDatabase {
       `),
       pendingOccurrences: this.db.prepare(`
         SELECT occurrence.*, schedule.guild_id, schedule.channel_id,
-          schedule.owner_user_id, schedule.visibility, schedule.kind,
+          schedule.owner_user_id, schedule.mention_user_id, schedule.visibility, schedule.kind,
           schedule.title, schedule.details, schedule.task_prompt, schedule.timezone,
           schedule.event_at
         FROM schedule_occurrences AS occurrence
@@ -325,7 +331,8 @@ export class BotDatabase {
           AND status = 'active'
       `),
       updateSchedule: this.db.prepare(`
-        UPDATE scheduled_items SET title = @title, details = @details, visibility = @visibility,
+        UPDATE scheduled_items SET channel_id = @channelId, mention_user_id = @mentionUserId,
+          title = @title, details = @details, visibility = @visibility,
           task_prompt = @taskPrompt, cron_expression = @cronExpression,
           event_at = @eventAt, timezone = @timezone, next_run_at = @nextRunAt,
           status = @status, updated_at = @now
@@ -394,7 +401,9 @@ export class BotDatabase {
       const result = this.statements.updateSchedule.run({
         id: schedule.id,
         guildId: schedule.guild_id,
+        channelId: updated.channel_id,
         userId: schedule.owner_user_id,
+        mentionUserId: updated.mention_user_id ?? null,
         title: updated.title,
         details: updated.details,
         visibility: updated.visibility,
@@ -506,6 +515,7 @@ export class BotDatabase {
       guildId: schedule.guildId,
       channelId: schedule.channelId,
       ownerUserId: schedule.ownerUserId,
+      mentionUserId: schedule.mentionUserId ?? null,
       visibility: schedule.visibility,
       kind: schedule.kind,
       title: schedule.title,

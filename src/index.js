@@ -7,6 +7,7 @@ import {
   EmbedBuilder,
   GatewayIntentBits,
   MessageFlags,
+  PermissionFlagsBits,
   SlashCommandBuilder,
 } from "discord.js";
 import { loadConfig } from "./config.js";
@@ -57,6 +58,56 @@ let activeLoginChild = null;
 let schedulePollTimer = null;
 let schedulePollRunning = false;
 
+function getScheduleNotificationTargets(message) {
+  const channels = new Map();
+  const channelCandidates = [
+    ...(message.guild?.channels?.cache?.values?.() ?? []),
+    message.channel,
+  ];
+  for (const channel of channelCandidates) {
+    if (
+      !channel?.id
+      || channel.guildId !== config.allowedGuildId
+      || !channel.isTextBased?.()
+      || typeof channel.send !== "function"
+    ) continue;
+    if (channel.id !== message.channelId) {
+      const permissions = channel.permissionsFor?.(client.user);
+      const sendPermission = channel.isThread?.()
+        ? PermissionFlagsBits.SendMessagesInThreads
+        : PermissionFlagsBits.SendMessages;
+      if (
+        !permissions?.has(PermissionFlagsBits.ViewChannel)
+        || !permissions.has(sendPermission)
+      ) continue;
+    }
+    channels.set(channel.id, {
+      id: channel.id,
+      name: channel.name || channel.id,
+    });
+  }
+
+  const users = new Map();
+  const requesterName = message.member?.displayName
+    || message.author?.globalName
+    || message.author?.username;
+  if (!message.author?.bot && message.author?.id && requesterName) {
+    users.set(message.author.id, { id: message.author.id, name: requesterName });
+  }
+  for (const user of message.mentions?.users?.values?.() ?? []) {
+    if (user.bot) continue;
+    const displayName = message.mentions.members?.get(user.id)?.displayName
+      || user.globalName
+      || user.username;
+    users.set(user.id, { id: user.id, name: displayName });
+  }
+
+  return {
+    channels: [...channels.values()],
+    users: [...users.values()],
+  };
+}
+
 function log(event, fields = {}) {
   console.log(JSON.stringify({
     timestamp: new Date().toISOString(),
@@ -81,6 +132,7 @@ function createConversationKey(message) {
 function createCodexForMessage(message, {
   allowScheduleWrites = true,
   requesterUserId = message.author.id,
+  notificationTargets = getScheduleNotificationTargets(message),
 } = {}) {
   return createCodexClient({
     codexHome: config.codexHome,
@@ -90,6 +142,8 @@ function createCodexForMessage(message, {
     requesterUserId,
     databasePath: config.databasePath,
     timezone: config.scheduleTimezone,
+    notificationChannels: notificationTargets.channels,
+    notificationUsers: notificationTargets.users,
     allowScheduleWrites,
   });
 }
@@ -950,11 +1004,14 @@ async function processRequest({
   let currentPrompt = "";
   let failureStage = "conversation_load";
   const requestTime = new Date();
+  const notificationTargets = getScheduleNotificationTargets(sourceMessage);
   const discordContext = {
     guildId: sourceMessage.guildId,
     channelId: sourceMessage.channelId,
     isThread: sourceMessage.channel?.isThread?.() ?? false,
     requesterUserId,
+    notificationChannels: notificationTargets.channels,
+    notificationUsers: notificationTargets.users,
     timezone: config.scheduleTimezone,
     currentTimeUtc: requestTime.toISOString(),
     currentTimeLocal: new Intl.DateTimeFormat("ko-KR", {
@@ -964,7 +1021,7 @@ async function processRequest({
     }).format(requestTime),
   };
   try {
-    codex = createCodexForMessage(sourceMessage, { requesterUserId });
+    codex = createCodexForMessage(sourceMessage, { requesterUserId, notificationTargets });
     const conversation = database.getConversation(conversationKey);
     failureStage = "memory_lookup";
     const memory = database.findRelevantMemory(guildId, question, MEMORY_LIMIT);
@@ -1079,7 +1136,8 @@ async function sendScheduleNotification(schedule, content) {
     throw new Error("The schedule's Discord channel is no longer available for messages.");
   }
 
-  const mention = `<@${schedule.owner_user_id}>`;
+  const mentionUserId = schedule.mention_user_id ?? schedule.owner_user_id;
+  const mention = `<@${mentionUserId}>`;
   const response = prepareDiscordResponse(content);
   const chunks = response.content
     ? splitForDiscord(response.content, config.maxDiscordMessageChars)
@@ -1088,7 +1146,7 @@ async function sendScheduleNotification(schedule, content) {
   await channel.send(responseSendOptions(
     response,
     firstContent,
-    { parse: [], users: [schedule.owner_user_id] },
+    { parse: [], users: [mentionUserId] },
   ));
 
   for (const chunk of chunks.slice(1)) {
