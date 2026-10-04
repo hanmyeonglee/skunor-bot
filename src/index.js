@@ -1123,10 +1123,10 @@ async function finishMcpLoginSession(session, outcome, terminateChild = false) {
     content = `${displayName} MCP 로그인을 취소했습니다.`;
     log("mcp_login_cancelled", { mcpName: session.serverName });
   } else if (outcome.kind === "expired") {
-    content = `${displayName} MCP 로그인 요청이 만료됐습니다. 다시 실행해 주세요: `/mcp-login ${session.serverName}``;
+    content = `${displayName} MCP 로그인 요청이 만료됐습니다. 다시 실행해 주세요: /mcp-login ${session.serverName}`;
     log("mcp_login_expired", { mcpName: session.serverName });
   } else {
-    content = `${displayName} MCP 로그인을 완료하지 못했습니다. 다시 실행해 주세요: `/mcp-login ${session.serverName}``;
+    content = `${displayName} MCP 로그인을 완료하지 못했습니다. 다시 실행해 주세요: /mcp-login ${session.serverName}`;
     log("mcp_login_failed", {
       mcpName: session.serverName,
       ...(Number.isInteger(outcome.code) ? { exitCode: outcome.code } : {}),
