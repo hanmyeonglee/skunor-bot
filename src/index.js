@@ -1047,23 +1047,26 @@ function validateMcpCallbackUrl(session, rawCallbackUrl) {
     return "이 URL은 현재 로그인 요청에 대한 응답이 아닙니다. 방금 승인한 브라우저 탭의 주소를 복사해 주세요.";
   }
   if (callback.searchParams.has("error")) {
-    return "Notion 승인이 취소되었거나 거부되었습니다. `/mcp-login notion`으로 다시 시작해 주세요.";
+    const displayName = getMcpDisplayName(session.serverName);
+    return `${displayName} 승인이 취소되었거나 거부되었습니다. \`/mcp-login ${session.serverName}\`으로 다시 시작해 주세요.`;
   }
   if (!callback.searchParams.get("code")) {
-    return "승인 코드가 URL에 없습니다. Notion 승인을 마친 뒤 브라우저 주소창의 전체 URL을 복사해 주세요.";
+    return "승인 코드가 URL에 없습니다. 승인을 마친 뒤 브라우저 주소창의 전체 URL을 복사해 주세요.";
   }
   return null;
 }
 
 function getMcpDisplayName(serverName) {
-  return serverName === "notion" ? "Notion" : serverName;
+  if (serverName === "notion") return "Notion";
+  if (serverName === "jira") return "Jira";
+  return serverName;
 }
 
 function buildMcpLoginMessage(session) {
   const displayName = getMcpDisplayName(session.serverName);
   const content = [
     `**${displayName} MCP 로그인**`,
-    "로그인 버튼을 눌러 워크스페이스 접근을 승인해 주세요.",
+    `${displayName} 접근을 승인하려면 로그인 버튼을 눌러 주세요.`,
     "승인 후 브라우저에서 localhost 접속 오류가 보이면 정상입니다. 주소창의 전체 URL을 복사해 ‘승인 URL 붙여넣기’를 누르세요.",
     "콜백 URL에는 일회용 인증 코드가 포함됩니다. 이 비공개 응답의 입력창에만 붙여넣어 주세요. 로그인 요청은 10분 뒤 만료됩니다.",
   ].join("\n\n");
@@ -1236,7 +1239,7 @@ async function handleMcpLoginButton(interaction) {
   const [, action, sessionId] = match;
   const session = activeMcpLogin;
   if (!session || session.id !== sessionId || session.finalized) {
-    await interaction.reply({ content: "이 로그인 요청은 만료됐습니다. `/mcp-login notion`으로 다시 시작해 주세요.", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: "이 로그인 요청은 만료됐습니다. `/mcp-login`을 다시 실행해 주세요.", flags: MessageFlags.Ephemeral });
     return true;
   }
   if (interaction.user.id !== session.ownerUserId) {
@@ -2034,6 +2037,7 @@ async function main() {
             .setDescription("로그인할 MCP 서버 이름")
             .setRequired(true)
             .addChoices({ name: "Notion", value: "notion" })
+            .addChoices({ name: "Jira (Atlassian)", value: "jira" })
             .setMaxLength(32))
           .toJSON(),
         config.allowedGuildId,
