@@ -1,14 +1,21 @@
 import http from "node:http";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { CronExpressionParser } from "cron-parser";
 import {
+  ActionRowBuilder,
   AttachmentBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   Client,
   EmbedBuilder,
   GatewayIntentBits,
   MessageFlags,
+  ModalBuilder,
   PermissionFlagsBits,
   SlashCommandBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } from "discord.js";
 import { loadConfig } from "./config.js";
 import { BotDatabase } from "./database.js";
@@ -21,6 +28,7 @@ import {
   ensureCodexHomeConfig,
   installDiscordApiSkill,
   describeCodexError,
+  MCP_OAUTH_SERVER_NAMES,
 } from "./codex.js";
 
 process.umask(0o077);
@@ -28,11 +36,13 @@ process.umask(0o077);
 const USER_ERROR_TEXT = "요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.";
 const LOGIN_REQUIRED_MESSAGE = "Codex 로그인이 필요합니다. `/login` 명령어로 이 봇의 Codex 계정을 인증한 뒤 요청을 다시 멘션해 주세요.";
 const LOGIN_IN_PROGRESS_MESSAGE = "Codex 로그인이 진행 중입니다. 완료된 뒤 요청을 다시 멘션해 주세요.";
+const MCP_LOGIN_IN_PROGRESS_MESSAGE = "MCP 로그인이 진행 중입니다. 완료된 뒤 요청을 다시 멘션해 주세요.";
 const THREAD_HISTORY_LIMIT = 12;
 const QNA_CONTEXT_FETCH_LIMIT = 50;
 const QNA_CONTEXT_MESSAGE_LIMIT = 12;
 const QNA_QUESTION_MAX_CHARS = 1_800;
 const MEMORY_LIMIT = 4;
+const MCP_LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_CSV_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 const STRUCTURED_RESPONSE_PATTERN = /(?:^|\r?\n)\[\[SKUNOR_RESPONSE_V1\]\]\s*\r?\n([\s\S]*?)\r?\n\[\[\/SKUNOR_RESPONSE_V1\]\](?=\r?\n|$)/;
 
@@ -50,11 +60,13 @@ const client = new Client({
 });
 
 let queueTail = Promise.resolve();
+let queuedJobCount = 0;
 let shuttingDown = false;
 let healthServer;
 let activeJob = null;
 let loginRequested = false;
 let activeLoginChild = null;
+let activeMcpLogin = null;
 let schedulePollTimer = null;
 let schedulePollRunning = false;
 
@@ -467,13 +479,15 @@ async function postAnswer(sourceMessage, answer) {
 }
 
 function enqueue(job) {
+  queuedJobCount += 1;
   const completion = queueTail.then(async () => {
-    if (shuttingDown) return;
-    activeJob = job();
     try {
+      if (shuttingDown) return;
+      activeJob = job();
       return await activeJob;
     } finally {
       activeJob = null;
+      queuedJobCount -= 1;
     }
   });
   queueTail = completion.catch(() => {});
@@ -870,6 +884,10 @@ async function handleLoginCommand(interaction) {
   }
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  if (activeMcpLogin) {
+    await updateLoginInteraction(interaction, "MCP 로그인이 진행 중입니다. 완료된 뒤 Codex 로그인 명령을 다시 실행해 주세요.");
+    return;
+  }
   if (loginRequested) {
     await updateLoginInteraction(interaction, "이미 Codex 로그인이 진행 중입니다. 완료될 때까지 기다려 주세요.");
     return;
@@ -916,6 +934,373 @@ async function handleLoginCommand(interaction) {
   } finally {
     loginRequested = false;
   }
+}
+
+function parseMcpAuthorizationOutput(rawOutput) {
+  const output = rawOutput.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
+  const candidates = output.match(/https:\/\/[^\s<>"'`]+/g) || [];
+  for (const candidate of candidates) {
+    const cleanCandidate = candidate.replace(/[),.;\]}]+$/, "");
+    try {
+      const authorizationUrl = new URL(cleanCandidate);
+      const state = authorizationUrl.searchParams.get("state");
+      const redirectUri = authorizationUrl.searchParams.get("redirect_uri");
+      if (authorizationUrl.protocol !== "https:" || !state || !redirectUri) continue;
+      return {
+        authorizationUrl: authorizationUrl.href,
+        state,
+        redirect: new URL(redirectUri),
+      };
+    } catch {
+      // Ignore non-URL text and continue looking for the OAuth authorization link.
+    }
+  }
+  return null;
+}
+
+function startMcpOAuthProcess(serverName) {
+  let readyResolve;
+  let readyReject;
+  let doneResolve;
+  let readySettled = false;
+  let doneSettled = false;
+  let rawOutput = "";
+  const ready = new Promise((resolve, reject) => {
+    readyResolve = resolve;
+    readyReject = reject;
+  });
+  const done = new Promise((resolve) => {
+    doneResolve = resolve;
+  });
+  // A startup failure can occur before the command handler awaits `ready`.
+  ready.catch(() => {});
+
+  const child = spawn("codex", ["mcp", "login", serverName, "--no-browser"], {
+    env: createCodexCliEnvironment(config.codexHome),
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  const handleOutput = (chunk) => {
+    rawOutput = `${rawOutput}${chunk}`.slice(-24_000);
+    if (readySettled) return;
+    const authorization = parseMcpAuthorizationOutput(rawOutput);
+    if (!authorization) return;
+    readySettled = true;
+    readyResolve(authorization);
+  };
+
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", handleOutput);
+  child.stderr.on("data", handleOutput);
+  child.once("error", (error) => {
+    if (!readySettled) {
+      readySettled = true;
+      readyReject(error);
+    }
+    if (!doneSettled) {
+      doneSettled = true;
+      doneResolve({ error });
+    }
+  });
+  child.once("close", (code) => {
+    if (!readySettled) {
+      readySettled = true;
+      readyReject(Object.assign(new Error("Codex MCP OAuth did not provide an authorization URL."), {
+        exitCode: code,
+      }));
+    }
+    if (!doneSettled) {
+      doneSettled = true;
+      doneResolve({ code });
+    }
+  });
+
+  return { child, ready, done };
+}
+
+function validateMcpCallbackUrl(session, rawCallbackUrl) {
+  const value = rawCallbackUrl.trim();
+  if (!value || value.length > 4_000 || /[\r\n]/.test(value)) {
+    return "브라우저 주소창의 콜백 URL 전체를 한 줄로 붙여넣어 주세요.";
+  }
+
+  let callback;
+  try {
+    callback = new URL(value);
+  } catch {
+    return "URL 형식이 올바르지 않습니다. 브라우저 주소창의 전체 주소를 복사해 주세요.";
+  }
+
+  const expected = session.authorization.redirect;
+  const sameRedirect = callback.protocol === expected.protocol
+    && callback.hostname === expected.hostname
+    && callback.pathname === expected.pathname
+    && (!expected.port || callback.port === expected.port)
+    && !callback.username
+    && !callback.password;
+  if (!sameRedirect) {
+    return "이 주소는 현재 로그인 요청의 콜백 주소가 아닙니다. 방금 승인한 브라우저 탭의 주소를 복사해 주세요.";
+  }
+
+  if (callback.searchParams.get("state") !== session.authorization.state) {
+    return "이 URL은 현재 로그인 요청에 대한 응답이 아닙니다. 방금 승인한 브라우저 탭의 주소를 복사해 주세요.";
+  }
+  if (callback.searchParams.has("error")) {
+    return "Notion 승인이 취소되었거나 거부되었습니다. `/mcp-login notion`으로 다시 시작해 주세요.";
+  }
+  if (!callback.searchParams.get("code")) {
+    return "승인 코드가 URL에 없습니다. Notion 승인을 마친 뒤 브라우저 주소창의 전체 URL을 복사해 주세요.";
+  }
+  return null;
+}
+
+function getMcpDisplayName(serverName) {
+  return serverName === "notion" ? "Notion" : serverName;
+}
+
+function buildMcpLoginMessage(session) {
+  const displayName = getMcpDisplayName(session.serverName);
+  const content = [
+    `**${displayName} MCP 로그인**`,
+    "로그인 버튼을 눌러 워크스페이스 접근을 승인해 주세요.",
+    "승인 후 브라우저에서 localhost 접속 오류가 보이면 정상입니다. 주소창의 전체 URL을 복사해 ‘승인 URL 붙여넣기’를 누르세요.",
+    "콜백 URL에는 일회용 인증 코드가 포함됩니다. 이 비공개 응답의 입력창에만 붙여넣어 주세요. 로그인 요청은 10분 뒤 만료됩니다.",
+  ].join("\n\n");
+  const components = [];
+  const buttons = [];
+
+  if (session.authorization.authorizationUrl.length <= 512) {
+    buttons.push(new ButtonBuilder()
+      .setLabel(`${displayName} 로그인`)
+      .setStyle(ButtonStyle.Link)
+      .setURL(session.authorization.authorizationUrl));
+  }
+  buttons.push(new ButtonBuilder()
+    .setCustomId(`mcp_login_callback:${session.id}`)
+    .setLabel("승인 URL 붙여넣기")
+    .setStyle(ButtonStyle.Primary));
+  buttons.push(new ButtonBuilder()
+    .setCustomId(`mcp_login_cancel:${session.id}`)
+    .setLabel("취소")
+    .setStyle(ButtonStyle.Secondary));
+  components.push(new ActionRowBuilder().addComponents(buttons));
+
+  const finalContent = session.authorization.authorizationUrl.length <= 512
+    ? content
+    : `${content}\n\n[${displayName} 로그인 열기](<${session.authorization.authorizationUrl}>)`;
+  return { content: finalContent, components, allowedMentions: { parse: [] } };
+}
+
+async function editMcpLoginReply(interaction, content, components = []) {
+  if (!interaction) return;
+  try {
+    await interaction.editReply({
+      content,
+      components,
+      allowedMentions: { parse: [] },
+    });
+  } catch {
+    // The interaction can expire while a user completes OAuth in their browser.
+  }
+}
+
+async function finishMcpLoginSession(session, outcome, terminateChild = false) {
+  if (session.finalized) return;
+  session.finalized = true;
+  if (session.timeout) clearTimeout(session.timeout);
+  if (activeMcpLogin === session) activeMcpLogin = null;
+  if (terminateChild && session.child && session.child.exitCode === null) {
+    session.child.kill("SIGTERM");
+  }
+
+  const displayName = getMcpDisplayName(session.serverName);
+  let content;
+  if (outcome.kind === "success") {
+    content = `${displayName} MCP 로그인이 완료됐습니다. 인증 정보는 이 봇의 Codex 저장 공간에 보관됩니다.`;
+    log("mcp_login_completed", { mcpName: session.serverName });
+  } else if (outcome.kind === "cancelled") {
+    content = `${displayName} MCP 로그인을 취소했습니다.`;
+    log("mcp_login_cancelled", { mcpName: session.serverName });
+  } else if (outcome.kind === "expired") {
+    content = `${displayName} MCP 로그인 요청이 만료됐습니다. 다시 실행해 주세요: `/mcp-login ${session.serverName}``;
+    log("mcp_login_expired", { mcpName: session.serverName });
+  } else {
+    content = `${displayName} MCP 로그인을 완료하지 못했습니다. 다시 실행해 주세요: `/mcp-login ${session.serverName}``;
+    log("mcp_login_failed", {
+      mcpName: session.serverName,
+      ...(Number.isInteger(outcome.code) ? { exitCode: outcome.code } : {}),
+      ...(outcome.error?.code ? { errorCode: outcome.error.code } : {}),
+    });
+  }
+
+  await editMcpLoginReply(session.commandInteraction, content);
+  if (session.callbackInteraction) {
+    await editMcpLoginReply(session.callbackInteraction, content);
+  }
+}
+
+async function handleMcpLoginCommand(interaction) {
+  if (!interaction.isChatInputCommand() || interaction.commandName !== "mcp-login") return;
+  if (interaction.guildId !== config.allowedGuildId) {
+    await interaction.reply({
+      content: "이 서버에서는 MCP 로그인 명령을 사용할 수 없습니다.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const serverName = interaction.options.getString("mcp_name", true).trim().toLowerCase();
+  if (!MCP_OAUTH_SERVER_NAMES.includes(serverName)) {
+    await interaction.reply({
+      content: `로그인할 수 있는 MCP 이름은 다음과 같습니다: ${MCP_OAUTH_SERVER_NAMES.join(", ")}`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  if (activeMcpLogin || loginRequested || activeLoginChild) {
+    await editMcpLoginReply(interaction, "Codex 또는 MCP 로그인이 이미 진행 중입니다. 완료된 뒤 다시 시도해 주세요.");
+    return;
+  }
+  if (queuedJobCount > 0) {
+    await editMcpLoginReply(interaction, "현재 Codex 작업이 끝난 뒤 다시 시도해 주세요.");
+    return;
+  }
+
+  const session = {
+    id: randomUUID(),
+    serverName,
+    ownerUserId: interaction.user.id,
+    commandInteraction: interaction,
+    callbackInteraction: null,
+    authorization: null,
+    child: null,
+    timeout: null,
+    finalized: false,
+    phase: "starting",
+    closedResult: null,
+  };
+  activeMcpLogin = session;
+
+  try {
+    const process = startMcpOAuthProcess(serverName);
+    session.child = process.child;
+    process.done.then((result) => {
+      session.closedResult = result;
+      if (session.authorization && ["waiting", "exchanging"].includes(session.phase)) {
+        void finishMcpLoginSession(session, result.error || result.code !== 0
+          ? { kind: "failed", ...result }
+          : { kind: "success" });
+      }
+    });
+
+    const startupTimer = setTimeout(() => {
+      process.child.kill("SIGTERM");
+    }, 45_000);
+    let authorization;
+    try {
+      authorization = await process.ready;
+    } finally {
+      clearTimeout(startupTimer);
+    }
+    session.authorization = authorization;
+    if (session.closedResult) {
+      await finishMcpLoginSession(session, session.closedResult.error || session.closedResult.code !== 0
+        ? { kind: "failed", ...session.closedResult }
+        : { kind: "success" });
+      return;
+    }
+
+    session.timeout = setTimeout(() => {
+      void finishMcpLoginSession(session, { kind: "expired" }, true);
+    }, MCP_LOGIN_TIMEOUT_MS);
+    session.timeout.unref?.();
+    await interaction.editReply(buildMcpLoginMessage(session));
+    session.phase = "waiting";
+    if (session.closedResult) {
+      await finishMcpLoginSession(session, session.closedResult.error || session.closedResult.code !== 0
+        ? { kind: "failed", ...session.closedResult }
+        : { kind: "success" });
+    }
+  } catch (error) {
+    await finishMcpLoginSession(session, { kind: "failed", error });
+  }
+}
+
+async function handleMcpLoginButton(interaction) {
+  if (!interaction.isButton()) return false;
+  const match = interaction.customId.match(/^mcp_login_(callback|cancel):([0-9a-f-]{36})$/i);
+  if (!match) return false;
+  const [, action, sessionId] = match;
+  const session = activeMcpLogin;
+  if (!session || session.id !== sessionId || session.finalized) {
+    await interaction.reply({ content: "이 로그인 요청은 만료됐습니다. `/mcp-login notion`으로 다시 시작해 주세요.", flags: MessageFlags.Ephemeral });
+    return true;
+  }
+  if (interaction.user.id !== session.ownerUserId) {
+    await interaction.reply({ content: "이 로그인 요청을 시작한 사용자만 완료할 수 있습니다.", flags: MessageFlags.Ephemeral });
+    return true;
+  }
+
+  if (action === "cancel") {
+    await interaction.deferUpdate();
+    await finishMcpLoginSession(session, { kind: "cancelled" }, true);
+    return true;
+  }
+
+  const callbackInput = new TextInputBuilder()
+    .setCustomId("callback_url")
+    .setLabel("브라우저 주소창의 전체 URL")
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(true)
+    .setMaxLength(4_000)
+    .setPlaceholder("http://127.0.0.1:.../callback?code=...&state=...");
+  const modal = new ModalBuilder()
+    .setCustomId(`mcp_login_callback:${session.id}`)
+    .setTitle(`${getMcpDisplayName(session.serverName)} 승인 결과`)
+    .addComponents(new ActionRowBuilder().addComponents(callbackInput));
+  await interaction.showModal(modal);
+  return true;
+}
+
+async function handleMcpLoginCallback(interaction) {
+  if (!interaction.isModalSubmit()) return false;
+  const match = interaction.customId.match(/^mcp_login_callback:([0-9a-f-]{36})$/i);
+  if (!match) return false;
+  const session = activeMcpLogin;
+  if (!session || session.id !== match[1] || session.finalized) {
+    await interaction.reply({ content: "이 로그인 요청은 만료됐습니다. 다시 시작해 주세요.", flags: MessageFlags.Ephemeral });
+    return true;
+  }
+  if (interaction.user.id !== session.ownerUserId) {
+    await interaction.reply({ content: "이 로그인 요청을 시작한 사용자만 완료할 수 있습니다.", flags: MessageFlags.Ephemeral });
+    return true;
+  }
+  if (session.phase !== "waiting" || !session.child?.stdin?.writable) {
+    await interaction.reply({ content: "로그인 처리가 이미 끝났습니다. 다시 시작해 주세요.", flags: MessageFlags.Ephemeral });
+    return true;
+  }
+
+  const callbackUrl = interaction.fields.getTextInputValue("callback_url");
+  const validationError = validateMcpCallbackUrl(session, callbackUrl);
+  if (validationError) {
+    await interaction.reply({ content: validationError, flags: MessageFlags.Ephemeral });
+    return true;
+  }
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  session.callbackInteraction = interaction;
+  session.phase = "exchanging";
+  try {
+    session.child.stdin.write(`${callbackUrl.trim()}\n`);
+  } catch (error) {
+    await finishMcpLoginSession(session, { kind: "failed", error }, true);
+    return true;
+  }
+  await editMcpLoginReply(interaction, "승인 결과를 확인하고 있습니다. 완료될 때까지 잠시 기다려 주세요.");
+  return true;
 }
 
 function isQuotaRecheckRequest(question) {
@@ -1257,7 +1642,7 @@ async function executeScheduleOccurrence(occurrence) {
 }
 
 function pollSchedules() {
-  if (schedulePollRunning || shuttingDown || !client.isReady()) return;
+  if (schedulePollRunning || shuttingDown || activeMcpLogin || !client.isReady()) return;
   schedulePollRunning = true;
   try {
     const currentTime = new Date();
@@ -1349,6 +1734,10 @@ async function processInitialQnaRequest({
   let progress = null;
   let stopFallbackTyping = null;
   try {
+    if (activeMcpLogin) {
+      await saveReply(conversationKey, sourceMessage, MCP_LOGIN_IN_PROGRESS_MESSAGE);
+      return;
+    }
     if (loginRequested) {
       await saveReply(conversationKey, sourceMessage, LOGIN_IN_PROGRESS_MESSAGE);
       return;
@@ -1390,6 +1779,14 @@ async function handleQnaCommand(interaction) {
   if (interaction.guildId !== config.allowedGuildId) {
     await interaction.reply({
       content: "이 서버에서는 Q&A 명령을 사용할 수 없습니다.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  if (activeMcpLogin) {
+    await interaction.reply({
+      content: MCP_LOGIN_IN_PROGRESS_MESSAGE,
       flags: MessageFlags.Ephemeral,
     });
     return;
@@ -1549,6 +1946,10 @@ async function handleMessage(message) {
   let progress = null;
   let stopFallbackTyping = null;
   try {
+    if (activeMcpLogin) {
+      await saveReply(conversationKey, message, MCP_LOGIN_IN_PROGRESS_MESSAGE);
+      return;
+    }
     if (loginRequested) {
       await saveReply(conversationKey, message, LOGIN_IN_PROGRESS_MESSAGE);
       return;
@@ -1626,6 +2027,19 @@ async function main() {
       );
       await client.application.commands.create(
         new SlashCommandBuilder()
+          .setName("mcp-login")
+          .setDescription("MCP 서버에 OAuth 로그인합니다.")
+          .addStringOption((option) => option
+            .setName("mcp_name")
+            .setDescription("로그인할 MCP 서버 이름")
+            .setRequired(true)
+            .addChoices({ name: "Notion", value: "notion" })
+            .setMaxLength(32))
+          .toJSON(),
+        config.allowedGuildId,
+      );
+      await client.application.commands.create(
+        new SlashCommandBuilder()
           .setName("qna")
           .setDescription("최근 대화를 바탕으로 답변하는 Q&A 스레드를 엽니다.")
           .addStringOption((option) => option
@@ -1658,6 +2072,27 @@ async function main() {
       return;
     }
 
+    if (interaction.isChatInputCommand() && interaction.commandName === "mcp-login") {
+      void handleMcpLoginCommand(interaction).catch((error) => {
+        log("mcp_login_interaction_failed", { diagnostic: describeCodexError(error) });
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith("mcp_login_")) {
+      void handleMcpLoginButton(interaction).catch((error) => {
+        log("mcp_login_button_failed", { diagnostic: describeCodexError(error) });
+      });
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("mcp_login_callback:")) {
+      void handleMcpLoginCallback(interaction).catch((error) => {
+        log("mcp_login_callback_failed", { diagnostic: describeCodexError(error) });
+      });
+      return;
+    }
+
     void handleLoginCommand(interaction).catch((error) => {
       log("login_interaction_failed", { diagnostic: describeCodexError(error) });
     });
@@ -1668,6 +2103,11 @@ async function main() {
     shuttingDown = true;
     log("shutdown_started", { signal });
     activeLoginChild?.kill("SIGTERM");
+    if (activeMcpLogin) {
+      if (activeMcpLogin.timeout) clearTimeout(activeMcpLogin.timeout);
+      activeMcpLogin.finalized = true;
+      activeMcpLogin.child?.kill("SIGTERM");
+    }
     if (schedulePollTimer) clearInterval(schedulePollTimer);
     client.destroy();
     healthServer.close();
