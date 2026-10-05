@@ -16,6 +16,7 @@ const PUBLIC_GOOGLE_DOCS_SKILL_SOURCE = path.join(APP_ROOT, "skills", "public-go
 const SCHEDULE_MCP_SERVER = path.join(APP_ROOT, "dist", "schedule-mcp.js");
 const PUBLIC_NOTION_MCP_SERVER = path.join(APP_ROOT, "dist", "public-notion-mcp.js");
 const SCHEDULE_MCP_NODE = process.execPath;
+const CODEX_HOME_CONFIG_HEADER = "# Managed by skunor-bot. Use a dedicated CODEX_HOME volume.";
 const NOTION_MCP_CONFIG = `
 [mcp_servers.notion]
 url = "https://mcp.notion.com/mcp"
@@ -40,7 +41,7 @@ startup_timeout_sec = 10
 tool_timeout_sec = 60
 `;
 
-const CODEX_HOME_CONFIG = `# Managed by skunor-bot. Use a dedicated CODEX_HOME volume.
+const CODEX_HOME_CONFIG = `${CODEX_HOME_CONFIG_HEADER}
 approval_policy = "never"
 default_permissions = "discord_research"
 mcp_oauth_credentials_store = "file"
@@ -74,62 +75,6 @@ startup_timeout_sec = 10
 tool_timeout_sec = 30
 env_vars = ["DATABASE_PATH", "SCHEDULE_REQUESTER_ID", "SCHEDULE_GUILD_ID", "SCHEDULE_CHANNEL_ID", "SCHEDULE_NOTIFICATION_CHANNEL_OPTIONS_JSON", "SCHEDULE_NOTIFICATION_USER_OPTIONS_JSON", "SCHEDULE_ALLOW_WRITES", "SCHEDULE_TIME_ZONE"]
 ${NOTION_MCP_CONFIG}${JIRA_MCP_CONFIG}${PUBLIC_NOTION_MCP_CONFIG}`;
-
-const PRE_JIRA_CODEX_HOME_CONFIG = CODEX_HOME_CONFIG.replace(JIRA_MCP_CONFIG, "");
-const PRE_PUBLIC_NOTION_CODEX_HOME_CONFIG = PRE_JIRA_CODEX_HOME_CONFIG.replace(PUBLIC_NOTION_MCP_CONFIG, "");
-const PRE_MCP_LOGIN_CODEX_HOME_CONFIG = PRE_PUBLIC_NOTION_CODEX_HOME_CONFIG.replace(NOTION_MCP_CONFIG, "");
-const PREVIOUS_CURRENT_CODEX_HOME_CONFIG = PRE_MCP_LOGIN_CODEX_HOME_CONFIG.replace(
-  'mcp_oauth_credentials_store = "file"\n',
-  "",
-);
-
-const PRE_NOTIFICATION_TARGETS_CODEX_HOME_CONFIG = PREVIOUS_CURRENT_CODEX_HOME_CONFIG.replace(
-  ', "SCHEDULE_NOTIFICATION_CHANNEL_OPTIONS_JSON", "SCHEDULE_NOTIFICATION_USER_OPTIONS_JSON"',
-  "",
-);
-
-const PREVIOUS_CODEX_HOME_CONFIG = `# Managed by skunor-bot. Use a dedicated CODEX_HOME volume.
-approval_policy = "never"
-default_permissions = "discord_research"
-
-[permissions.discord_research]
-description = "Read-only research with no local command network access"
-extends = ":read-only"
-
-[permissions.discord_research.filesystem]
-":root" = "deny"
-":minimal" = "read"
-"/workspace" = "read"
-"/data" = "deny"
-# Codex creates executable dispatch symlinks under CODEX_HOME/tmp/arg0.
-# Allow only this directory so the sandbox helper can start without exposing auth data.
-"/data/codex/tmp/arg0" = "read"
-"/app" = "deny"
-"/tmp" = "deny"
-
-[permissions.discord_research.network]
-enabled = false
-`;
-
-const LEGACY_CODEX_HOME_CONFIG = `# Managed by skunor-bot. Use a dedicated CODEX_HOME volume.
-approval_policy = "never"
-default_permissions = "discord_research"
-
-[permissions.discord_research]
-description = "Read-only research with no local command network access"
-extends = ":read-only"
-
-[permissions.discord_research.filesystem]
-":root" = "deny"
-":minimal" = "read"
-"/workspace" = "read"
-"/data" = "deny"
-"/app" = "deny"
-"/tmp" = "deny"
-
-[permissions.discord_research.network]
-enabled = false
-`;
 
 const BOT_INSTRUCTIONS = `너는 스쿠너 팀의 연구보조 AI, 스쿠너다.
 이름이나 정체를 물으면 "저는 스쿠너 팀의 연구보조 AI 스쿠너입니다."라고 소개한다. 일반적인 자기소개에서는 ChatGPT나 Codex 등 기반 제품 이름 대신 스쿠너로 자신을 소개한다. 기반 모델이나 제공자를 직접 물으면 확인 가능한 사실만 답하고, 모르는 정보는 모른다고 한다.
@@ -176,20 +121,15 @@ export function ensureCodexHomeConfig(codexHome: string): void {
 
   if (fs.existsSync(configPath)) {
     const current = fs.readFileSync(configPath, "utf8");
-    if (
-      current === PRE_MCP_LOGIN_CODEX_HOME_CONFIG
-      || current === PRE_JIRA_CODEX_HOME_CONFIG
-      || current === PRE_PUBLIC_NOTION_CODEX_HOME_CONFIG
-      || current === PREVIOUS_CURRENT_CODEX_HOME_CONFIG
-      || current === PRE_NOTIFICATION_TARGETS_CODEX_HOME_CONFIG
-      || current === PREVIOUS_CODEX_HOME_CONFIG
-      || current === LEGACY_CODEX_HOME_CONFIG
-    ) {
+    if (current !== CODEX_HOME_CONFIG) {
+      const firstLine = current.split(/\r?\n/u, 1)[0];
+      if (firstLine !== CODEX_HOME_CONFIG_HEADER) {
+        throw new Error("CODEX_HOME contains a config.toml without the skunor-bot managed-config marker");
+      }
       const temporaryConfigPath = path.join(codexHome, `config.toml.${process.pid}.tmp`);
       fs.writeFileSync(temporaryConfigPath, CODEX_HOME_CONFIG, { mode: 0o600, flag: "wx" });
       fs.renameSync(temporaryConfigPath, configPath);
-    } else if (current !== CODEX_HOME_CONFIG) {
-      throw new Error("CODEX_HOME contains a config.toml that does not match the bot's required sandbox profile");
+      console.warn(JSON.stringify({ event: "codex_home_config_migrated" }));
     }
     fs.chmodSync(configPath, 0o600);
     return;
