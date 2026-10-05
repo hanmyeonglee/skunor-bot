@@ -5,14 +5,20 @@ import Database from "better-sqlite3";
 const MAX_MEMORY_TERMS = 1_200;
 const MAX_QUERY_TERMS = 100;
 
+type PreparedStatement = {
+  all: (...params: any[]) => any[];
+  get: (...params: any[]) => any;
+  run: (...params: any[]) => Database.RunResult;
+};
+
 function now() {
   return new Date().toISOString();
 }
 
 function getTerms(text, maxTerms = MAX_MEMORY_TERMS) {
   const normalized = text.normalize("NFKC").toLocaleLowerCase("ko-KR");
-  const words = normalized.match(/[\p{L}\p{N}]+/gu) ?? [];
-  const terms = new Set();
+  const words: string[] = normalized.match(/[\p{L}\p{N}]+/gu) ?? [];
+  const terms = new Set<string>();
 
   for (const word of words) {
     const chars = Array.from(word);
@@ -38,6 +44,15 @@ function getTerms(text, maxTerms = MAX_MEMORY_TERMS) {
 }
 
 export class BotDatabase {
+  db: Database.Database;
+  statements: Record<string, PreparedStatement>;
+  saveMemoryTransaction: (entry: any) => void;
+  claimPendingOccurrencesTransaction: (limit: number) => any[];
+  insertReminderOccurrenceTransaction: (args: any) => boolean;
+  advanceCronOccurrenceTransaction: (args: any) => boolean;
+  updateScheduleTransaction: (args: any) => any;
+  cancelScheduleTransaction: (args: any) => boolean;
+
   constructor(databasePath) {
     fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
     this.db = new Database(databasePath);
@@ -154,7 +169,7 @@ export class BotDatabase {
         ON schedule_occurrences(status, scheduled_at);
     `);
 
-    const scheduledItemColumns = this.db.pragma("table_info(scheduled_items)");
+    const scheduledItemColumns = this.db.pragma("table_info(scheduled_items)") as { name: string }[];
     if (!scheduledItemColumns.some((column) => column.name === "mention_user_id")) {
       this.db.exec("ALTER TABLE scheduled_items ADD COLUMN mention_user_id TEXT");
     }

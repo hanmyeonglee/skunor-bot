@@ -89,7 +89,7 @@ const tools = [
   },
 ];
 
-let database;
+let database: BotDatabase;
 
 function getRequestContext() {
   const context = {
@@ -209,7 +209,7 @@ function normalizeCronExpression(expression, timezone, currentDate = new Date())
     const iterator = CronExpressionParser.parse(expression.trim(), { currentDate, tz: timezone });
     return { expression: expression.trim(), nextRunAt: iterator.next().toDate().toISOString() };
   } catch (error) {
-    throw new Error(`Invalid cronExpression: ${error.message}`);
+    throw new Error(`Invalid cronExpression: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -329,7 +329,7 @@ function updateSchedule(args) {
     throw new Error("Active schedule not found or not owned by the current requester.");
   }
 
-  const changes = {};
+  const changes: Record<string, any> = {};
   if (args.title !== undefined) changes.title = cleanText(args.title, "title", 160);
   if (args.visibility !== undefined) changes.visibility = normalizeVisibility(args.visibility);
   if (args.timezone !== undefined) changes.timezone = validateTimezone(args.timezone);
@@ -426,7 +426,8 @@ function handleRequest(request) {
       const result = handleToolCall(request.params?.name, request.params?.arguments ?? {});
       return { jsonrpc: "2.0", id: request.id, result };
     } catch (error) {
-      return { jsonrpc: "2.0", id: request.id, result: { ...toolText(error.message), isError: true } };
+      const message = error instanceof Error ? error.message : String(error);
+      return { jsonrpc: "2.0", id: request.id, result: { ...toolText(message), isError: true } };
     }
   }
   if (request.id === undefined) return null;
@@ -459,6 +460,6 @@ process.stdin.on("end", () => {
 try {
   database = new BotDatabase(process.env.DATABASE_PATH || "./data/bot.sqlite3");
 } catch (error) {
-  process.stderr.write(`schedule MCP startup failed: ${error.message}\n`);
+  process.stderr.write(`schedule MCP startup failed: ${error instanceof Error ? error.message : String(error)}\n`);
   process.exit(1);
 }

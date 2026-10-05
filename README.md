@@ -91,7 +91,7 @@ SQLite 파일에는 Discord 대화 원문과 성공한 요청·응답이 저장�
 
 ## 로컬 실행
 
-Node.js 24 이상과 npm이 필요합니다.
+Node.js 24 이상과 npm이 필요합니다. `npm start`가 먼저 TypeScript를 컴파일합니다.
 
 ```sh
 npm install
@@ -100,4 +100,4 @@ npm start
 
 로컬 실행에서도 Codex CLI 로그인 상태와 `curl`, `jq`, `poppler-utils`가 필요하며 `CODEX_HOME`에 스킬을 설치하고 권한 프로필을 초기화합니다.
 
-`npm run typecheck`는 TypeScript 컴파일러로 `src`의 JavaScript·TypeScript 구문을 검사합니다. Docker 이미지 빌드에서도 이 검사를 통과해야 합니다. 기존 봇 코드는 JavaScript로 실행되며, 컴파일러는 이미지 생성 전에 제거됩니다.
+`npm run typecheck`는 타입 검사를 수행하고, `npm run build`는 `src/*.ts`를 `dist/`의 JavaScript로 컴파일합니다. Docker 이미지도 이 컴파일을 통과한 뒤 `dist/`를 실행합니다.

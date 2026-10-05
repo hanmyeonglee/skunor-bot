@@ -12,8 +12,8 @@ export const MCP_OAUTH_SERVER_NAMES = Object.freeze(["notion", "jira"]);
 const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DISCORD_API_SKILL_SOURCE = path.join(APP_ROOT, "skills", "discord-api");
 const PUBLIC_GOOGLE_DOCS_SKILL_SOURCE = path.join(APP_ROOT, "skills", "public-google-docs-pdf");
-const SCHEDULE_MCP_SERVER = path.join(APP_ROOT, "src", "schedule-mcp.js");
-const PUBLIC_NOTION_MCP_SERVER = path.join(APP_ROOT, "src", "public-notion-mcp.js");
+const SCHEDULE_MCP_SERVER = path.join(APP_ROOT, "dist", "schedule-mcp.js");
+const PUBLIC_NOTION_MCP_SERVER = path.join(APP_ROOT, "dist", "public-notion-mcp.js");
 const SCHEDULE_MCP_NODE = process.execPath;
 const NOTION_MCP_CONFIG = `
 [mcp_servers.notion]
@@ -313,7 +313,7 @@ export function createThreadOptions() {
     workingDirectory: CODEX_WORKING_DIRECTORY,
     skipGitRepoCheck: true,
     approvalPolicy: "never",
-  };
+  } as const;
 }
 
 function getCodexErrorDetails(error) {

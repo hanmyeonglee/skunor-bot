@@ -276,10 +276,11 @@ async function handleRequest(request) {
       };
     } catch (error) {
       const status = getHttpStatus(error);
-      const message = error?.message?.startsWith("유효한 ")
-        || error?.message?.startsWith("HTTPS ")
-        || error?.message?.startsWith("Notion 링크 ")
-        ? error.message
+      const errorText = error instanceof Error ? error.message : String(error);
+      const message = errorText.startsWith("유효한 ")
+        || errorText.startsWith("HTTPS ")
+        || errorText.startsWith("Notion 링크 ")
+        ? errorText
         : describeReadFailure(error);
       process.stderr.write(`${JSON.stringify({ event: "public_notion_fetch_failed", status })}\n`);
       return {

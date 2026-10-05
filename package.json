@@ -7,8 +7,10 @@
     "node": ">=24"
   },
   "scripts": {
-    "start": "node --env-file-if-exists=.env src/index.js",
-    "typecheck": "tsc --project tsconfig.json --noEmit"
+    "start": "node --env-file-if-exists=.env dist/index.js",
+    "typecheck": "tsc --project tsconfig.json --noEmit",
+    "build": "tsc --project tsconfig.json",
+    "prestart": "npm run build"
   },
   "dependencies": {
     "@openai/codex": "0.160.0",
@@ -19,6 +21,8 @@
     "notion-client": "8.0.8"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "9.6.0",
+    "@types/node": "24.19.1",
     "typescript": "6.0.3"
   }
 }

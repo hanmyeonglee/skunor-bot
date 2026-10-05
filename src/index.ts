@@ -16,6 +16,7 @@ import {
   SlashCommandBuilder,
   TextInputBuilder,
   TextInputStyle,
+  type MessageCreateOptions,
 } from "discord.js";
 import { loadConfig } from "./config.js";
 import { BotDatabase } from "./database.js";
@@ -555,7 +556,7 @@ function toDiscordEmbed(embed) {
 }
 
 function responseSendOptions(response, content, allowedMentions) {
-  const options = { allowedMentions };
+  const options: MessageCreateOptions = { allowedMentions };
   if (!response.embed) options.flags = MessageFlags.SuppressEmbeds;
   if (content) options.content = content;
   if (response.embed) options.embeds = [toDiscordEmbed(response.embed)];
@@ -1035,12 +1036,15 @@ async function handleLoginCommand(interaction) {
         log("codex_login_completed");
       } catch (error) {
         if (outputTimer !== null) clearTimeout(outputTimer);
+        const loginError = (
+          error instanceof Error ? error : new Error(String(error))
+        ) as Error & { kind?: string; exitCode?: number };
         log("codex_login_failed", {
-          category: error.kind || "login_failed",
-          ...(Number.isInteger(error.exitCode) ? { exitCode: error.exitCode } : {}),
-          diagnostic: describeCodexError(error),
+          category: loginError.kind || "login_failed",
+          ...(Number.isInteger(loginError.exitCode) ? { exitCode: loginError.exitCode } : {}),
+          diagnostic: describeCodexError(loginError),
         });
-        await updateLoginInteraction(interaction, formatLoginFailure(rawOutput, error));
+        await updateLoginInteraction(interaction, formatLoginFailure(rawOutput, loginError));
       }
     });
   } finally {
@@ -1077,11 +1081,11 @@ function startMcpOAuthProcess(serverName) {
   let readySettled = false;
   let doneSettled = false;
   let rawOutput = "";
-  const ready = new Promise((resolve, reject) => {
+  const ready = new Promise((resolve: (authorization: { authorizationUrl: string; state: string; redirect: URL }) => void, reject) => {
     readyResolve = resolve;
     readyReject = reject;
   });
-  const done = new Promise((resolve) => {
+  const done = new Promise<{ error?: Error; code?: number }>((resolve) => {
     doneResolve = resolve;
   });
   // A startup failure can occur before the command handler awaits `ready`.
@@ -1375,7 +1379,7 @@ async function handleMcpLoginButton(interaction) {
   const modal = new ModalBuilder()
     .setCustomId(`mcp_login_callback:${session.id}`)
     .setTitle(`${getMcpDisplayName(session.serverName)} 승인 결과`)
-    .addComponents(new ActionRowBuilder().addComponents(callbackInput));
+    .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(callbackInput));
   await interaction.showModal(modal);
   return true;
 }
@@ -1633,7 +1637,7 @@ function formatScheduleTime(isoDate, timezone) {
 async function sendScheduleNotification(schedule, content) {
   let channel = client.channels.cache.get(schedule.channel_id);
   if (!channel) channel = await client.channels.fetch(schedule.channel_id);
-  if (!channel?.isTextBased?.() || typeof channel.send !== "function") {
+  if (!channel?.isTextBased?.() || !("send" in channel) || typeof channel.send !== "function") {
     throw new Error("The schedule's Discord channel is no longer available for messages.");
   }
 
