@@ -1,21 +1,192 @@
 import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
+import type { ResearchMemoryEntry } from "./types.js";
 
 const MAX_MEMORY_TERMS = 1_200;
 const MAX_QUERY_TERMS = 100;
 
-type PreparedStatement = {
-  all: (...params: any[]) => any[];
-  get: (...params: any[]) => any;
-  run: (...params: any[]) => Database.RunResult;
+type SqlScalar = string | number | bigint | boolean | Uint8Array | null | undefined;
+type SqlParameter = SqlScalar | Readonly<Record<string, SqlScalar>>;
+type RawSqlScalar = Exclude<SqlScalar, undefined>;
+type RawSqlRow = Record<string, RawSqlScalar>;
+type EmptyRow = Record<string, never>;
+
+type PreparedStatement<Row extends object> = {
+  all: (...params: SqlParameter[]) => Row[];
+  get: (...params: SqlParameter[]) => Row | undefined;
+  run: (...params: SqlParameter[]) => Database.RunResult;
 };
 
-function now() {
+type ConversationRow = {
+  conversation_key: string;
+  guild_id: string;
+  channel_id: string;
+  owner_user_id?: string;
+  codex_thread_id?: string;
+  created_at: string;
+  updated_at: string;
+};
+
+type MessageRow = { role: "user" | "assistant"; content: string };
+type QnaThreadRow = { guild_id: string };
+type MemoryRow = ResearchMemoryEntry & { relevance: number };
+type StateRow = { value: string };
+type ScheduleKind = "cron" | "event";
+type ScheduleVisibility = "personal" | "shared";
+type ScheduleStatus = "active" | "cancelled" | "completed";
+export type ScheduleRow = {
+  id: string;
+  guild_id: string;
+  channel_id: string;
+  owner_user_id: string;
+  mention_user_id?: string;
+  visibility: ScheduleVisibility;
+  kind: ScheduleKind;
+  title: string;
+  details?: string;
+  task_prompt?: string;
+  cron_expression?: string;
+  event_at?: string;
+  reminder_offsets: string;
+  timezone: string;
+  next_run_at?: string;
+  status: ScheduleStatus;
+  created_at: string;
+  updated_at: string;
+};
+type ScheduleListRow = ScheduleRow & { latest_result?: string; latest_run_at?: string };
+export type OccurrenceRow = {
+  id: number;
+  schedule_id: string;
+  run_type: "cron" | "event_reminder";
+  scheduled_at: string;
+  status: "pending" | "running" | "succeeded" | "failed" | "cancelled";
+  result?: string;
+  error?: string;
+  created_at: string;
+  started_at?: string;
+  completed_at?: string;
+  guild_id: string;
+  channel_id: string;
+  owner_user_id: string;
+  mention_user_id?: string;
+  visibility: ScheduleVisibility;
+  kind: ScheduleKind;
+  title: string;
+  details?: string;
+  task_prompt?: string;
+  timezone: string;
+  event_at?: string;
+};
+type MemoryInput = {
+  guildId: string;
+  conversationKey: string;
+  question: string;
+  answer: string;
+};
+export type ScheduleInput = {
+  id: string;
+  guildId: string;
+  channelId: string;
+  ownerUserId: string;
+  mentionUserId?: string;
+  visibility: ScheduleVisibility;
+  kind: ScheduleKind;
+  title: string;
+  details?: string;
+  taskPrompt?: string;
+  cronExpression?: string;
+  eventAt?: string;
+  reminderOffsets?: number[];
+  timezone: string;
+  nextRunAt?: string;
+  status?: ScheduleStatus;
+};
+export type ScheduleChanges = Partial<Pick<ScheduleRow,
+  "channel_id" | "mention_user_id" | "visibility" | "title" | "details" | "task_prompt"
+  | "cron_expression" | "event_at" | "timezone" | "next_run_at" | "status"
+>>;
+type ScheduleUpdateInput = { schedule: ScheduleRow; changes: ScheduleChanges };
+type ScheduleLookup = { scheduleId: string; guildId: string; userId: string };
+type ScheduleTimeRange = {
+  guildId: string;
+  userId: string;
+  query?: string;
+  includeInactive?: boolean;
+  fromAt?: string;
+  toAt?: string;
+  limit?: number;
+};
+type ScheduleOccurrenceCompletion = {
+  id: number;
+  status: "succeeded" | "failed" | "cancelled";
+  result?: string;
+  error?: string;
+};
+type StatementBank = {
+  createConversation: PreparedStatement<EmptyRow>;
+  insertUserMessage: PreparedStatement<EmptyRow>;
+  insertAssistantMessage: PreparedStatement<EmptyRow>;
+  insertContextMessage: PreparedStatement<EmptyRow>;
+  getConversation: PreparedStatement<ConversationRow>;
+  insertQnaThread: PreparedStatement<EmptyRow>;
+  getQnaThread: PreparedStatement<QnaThreadRow>;
+  setThreadId: PreparedStatement<EmptyRow>;
+  recentMessages: PreparedStatement<MessageRow>;
+  insertMemory: PreparedStatement<EmptyRow>;
+  insertMemoryTerm: PreparedStatement<EmptyRow>;
+  searchMemory: PreparedStatement<MemoryRow>;
+  getState: PreparedStatement<StateRow>;
+  setState: PreparedStatement<EmptyRow>;
+  deleteState: PreparedStatement<EmptyRow>;
+  insertSchedule: PreparedStatement<EmptyRow>;
+  getSchedule: PreparedStatement<ScheduleRow>;
+  listSchedules: PreparedStatement<ScheduleListRow>;
+  getDueCronSchedules: PreparedStatement<ScheduleRow>;
+  getUpcomingEvents: PreparedStatement<ScheduleRow>;
+  insertOccurrence: PreparedStatement<EmptyRow>;
+  advanceCronSchedule: PreparedStatement<EmptyRow>;
+  pendingOccurrences: PreparedStatement<OccurrenceRow>;
+  claimOccurrence: PreparedStatement<EmptyRow>;
+  recoverRunningOccurrences: PreparedStatement<EmptyRow>;
+  finishOccurrence: PreparedStatement<EmptyRow>;
+  completePastEvents: PreparedStatement<EmptyRow>;
+  cancelExpiredEventReminders: PreparedStatement<EmptyRow>;
+  ownedActiveSchedule: PreparedStatement<ScheduleRow>;
+  updateSchedule: PreparedStatement<EmptyRow>;
+  cancelSchedule: PreparedStatement<EmptyRow>;
+  cancelPendingOccurrences: PreparedStatement<EmptyRow>;
+};
+
+function prepareStatement<Row extends object>(database: Database.Database, sql: string): PreparedStatement<Row> {
+  const statement = database.prepare(sql);
+  const bindings = (params: SqlParameter[]) => params.map((param) => {
+    if (param === undefined) return null;
+    if (param && typeof param === "object" && !ArrayBuffer.isView(param)) {
+      return Object.fromEntries(Object.entries(param).map(([key, value]) => [key, value === undefined ? null : value]));
+    }
+    return param;
+  });
+  const normalizeRow = (row: RawSqlRow): Row => Object.fromEntries(
+    Object.entries(row).filter(([, value]) => value !== null),
+  ) as Row;
+  return {
+    all: (...params) => (statement.all(...bindings(params)) as RawSqlRow[]).map(normalizeRow),
+    get: (...params) => {
+      const row = statement.get(...bindings(params));
+      if (!row || typeof row !== "object" || Array.isArray(row)) return undefined;
+      return normalizeRow(row as RawSqlRow);
+    },
+    run: (...params) => statement.run(...bindings(params)),
+  };
+}
+
+function now(): string {
   return new Date().toISOString();
 }
 
-function getTerms(text, maxTerms = MAX_MEMORY_TERMS) {
+function getTerms(text: string, maxTerms = MAX_MEMORY_TERMS): string[] {
   const normalized = text.normalize("NFKC").toLocaleLowerCase("ko-KR");
   const words: string[] = normalized.match(/[\p{L}\p{N}]+/gu) ?? [];
   const terms = new Set<string>();
@@ -45,15 +216,15 @@ function getTerms(text, maxTerms = MAX_MEMORY_TERMS) {
 
 export class BotDatabase {
   db: Database.Database;
-  statements: Record<string, PreparedStatement>;
-  saveMemoryTransaction: (entry: any) => void;
-  claimPendingOccurrencesTransaction: (limit: number) => any[];
-  insertReminderOccurrenceTransaction: (args: any) => boolean;
-  advanceCronOccurrenceTransaction: (args: any) => boolean;
-  updateScheduleTransaction: (args: any) => any;
-  cancelScheduleTransaction: (args: any) => boolean;
+  statements!: StatementBank;
+  saveMemoryTransaction!: Database.Transaction<(entry: MemoryInput) => void>;
+  claimPendingOccurrencesTransaction!: Database.Transaction<(limit: number) => OccurrenceRow[]>;
+  insertReminderOccurrenceTransaction!: Database.Transaction<(args: { scheduleId: string; scheduledAt: string }) => boolean>;
+  advanceCronOccurrenceTransaction!: Database.Transaction<(args: { scheduleId: string; scheduledAt: string; nextRunAt: string }) => boolean>;
+  updateScheduleTransaction!: Database.Transaction<(args: ScheduleUpdateInput) => ScheduleRow | undefined>;
+  cancelScheduleTransaction!: Database.Transaction<(args: ScheduleLookup) => boolean>;
 
-  constructor(databasePath) {
+  constructor(databasePath: string) {
     fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
     this.db = new Database(databasePath);
     if (databasePath !== ":memory:") fs.chmodSync(databasePath, 0o600);
@@ -174,8 +345,9 @@ export class BotDatabase {
       this.db.exec("ALTER TABLE scheduled_items ADD COLUMN mention_user_id TEXT");
     }
 
+    const prepare = <Row extends object = EmptyRow>(sql: string) => prepareStatement<Row>(this.db, sql);
     this.statements = {
-      createConversation: this.db.prepare(`
+      createConversation: prepare(`
         INSERT INTO conversations (
           conversation_key, guild_id, channel_id, owner_user_id, created_at, updated_at
         ) VALUES (
@@ -183,49 +355,49 @@ export class BotDatabase {
         )
         ON CONFLICT(conversation_key) DO UPDATE SET updated_at = excluded.updated_at
       `),
-      insertUserMessage: this.db.prepare(`
+      insertUserMessage: prepare(`
         INSERT OR IGNORE INTO messages (
           conversation_key, discord_message_id, user_id, role, content, created_at
         ) VALUES (@conversationKey, @discordMessageId, @userId, 'user', @content, @now)
       `),
-      insertAssistantMessage: this.db.prepare(`
+      insertAssistantMessage: prepare(`
         INSERT INTO messages (
           conversation_key, user_id, role, content, created_at
         ) VALUES (@conversationKey, NULL, 'assistant', @content, @now)
       `),
-      insertContextMessage: this.db.prepare(`
+      insertContextMessage: prepare(`
         INSERT INTO messages (conversation_key, role, content, created_at)
         VALUES (@conversationKey, @role, @content, @now)
       `),
-      getConversation: this.db.prepare(`
+      getConversation: prepare<ConversationRow>(`
         SELECT * FROM conversations WHERE conversation_key = ?
       `),
-      insertQnaThread: this.db.prepare(`
+      insertQnaThread: prepare(`
         INSERT OR IGNORE INTO qna_threads (
           thread_id, guild_id, parent_channel_id, owner_user_id, created_at
         ) VALUES (@threadId, @guildId, @parentChannelId, @ownerUserId, @now)
       `),
-      getQnaThread: this.db.prepare(`
+      getQnaThread: prepare<QnaThreadRow>(`
         SELECT guild_id FROM qna_threads WHERE thread_id = ?
       `),
-      setThreadId: this.db.prepare(`
+      setThreadId: prepare(`
         UPDATE conversations SET codex_thread_id = @threadId, updated_at = @now
         WHERE conversation_key = @conversationKey
       `),
-      recentMessages: this.db.prepare(`
+      recentMessages: prepare<MessageRow>(`
         SELECT role, content FROM messages
         WHERE conversation_key = @conversationKey AND discord_message_id IS NOT @excludeMessageId
         ORDER BY id DESC LIMIT @limit
       `),
-      insertMemory: this.db.prepare(`
+      insertMemory: prepare(`
         INSERT INTO research_memory (guild_id, conversation_key, question, answer, created_at)
         VALUES (@guildId, @conversationKey, @question, @answer, @now)
       `),
-      insertMemoryTerm: this.db.prepare(`
+      insertMemoryTerm: prepare(`
         INSERT INTO research_memory_terms (memory_id, term, weight)
         VALUES (@memoryId, @term, @weight)
       `),
-      searchMemory: this.db.prepare(`
+      searchMemory: prepare<MemoryRow>(`
         SELECT
           memory.question,
           memory.answer,
@@ -239,13 +411,13 @@ export class BotDatabase {
         ORDER BY relevance DESC, memory.created_at DESC
         LIMIT @limit
       `),
-      getState: this.db.prepare("SELECT value FROM bot_state WHERE key = ?"),
-      setState: this.db.prepare(`
+      getState: prepare<StateRow>("SELECT value FROM bot_state WHERE key = ?"),
+      setState: prepare(`
         INSERT INTO bot_state (key, value, updated_at) VALUES (@key, @value, @now)
         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
       `),
-      deleteState: this.db.prepare("DELETE FROM bot_state WHERE key = ?"),
-      insertSchedule: this.db.prepare(`
+      deleteState: prepare("DELETE FROM bot_state WHERE key = ?"),
+      insertSchedule: prepare(`
         INSERT INTO scheduled_items (
           id, guild_id, channel_id, owner_user_id, mention_user_id, visibility, kind, title, details,
           task_prompt, cron_expression, event_at, reminder_offsets, timezone,
@@ -256,8 +428,8 @@ export class BotDatabase {
           @nextRunAt, @status, @now, @now
         )
       `),
-      getSchedule: this.db.prepare("SELECT * FROM scheduled_items WHERE id = ?"),
-      listSchedules: this.db.prepare(`
+      getSchedule: prepare<ScheduleRow>("SELECT * FROM scheduled_items WHERE id = ?"),
+      listSchedules: prepare<ScheduleListRow>(`
         SELECT *,
           (SELECT substr(result, 1, 1500) FROM schedule_occurrences AS occurrence
            WHERE occurrence.schedule_id = scheduled_items.id
@@ -282,28 +454,28 @@ export class BotDatabase {
         ORDER BY COALESCE(event_at, next_run_at, created_at) ASC
         LIMIT @limit
       `),
-      getDueCronSchedules: this.db.prepare(`
+      getDueCronSchedules: prepare<ScheduleRow>(`
         SELECT * FROM scheduled_items
         WHERE kind = 'cron' AND status = 'active' AND next_run_at <= ?
         ORDER BY next_run_at ASC
         LIMIT ?
       `),
-      getUpcomingEvents: this.db.prepare(`
+      getUpcomingEvents: prepare<ScheduleRow>(`
         SELECT * FROM scheduled_items
         WHERE kind = 'event' AND status = 'active' AND event_at > ? AND event_at <= ?
         ORDER BY event_at ASC
         LIMIT ?
       `),
-      insertOccurrence: this.db.prepare(`
+      insertOccurrence: prepare(`
         INSERT OR IGNORE INTO schedule_occurrences (
           schedule_id, run_type, scheduled_at, status, created_at
         ) VALUES (@scheduleId, @runType, @scheduledAt, 'pending', @now)
       `),
-      advanceCronSchedule: this.db.prepare(`
+      advanceCronSchedule: prepare(`
         UPDATE scheduled_items SET next_run_at = @nextRunAt, updated_at = @now
         WHERE id = @scheduleId AND kind = 'cron' AND status = 'active'
       `),
-      pendingOccurrences: this.db.prepare(`
+      pendingOccurrences: prepare<OccurrenceRow>(`
         SELECT occurrence.*, schedule.guild_id, schedule.channel_id,
           schedule.owner_user_id, schedule.mention_user_id, schedule.visibility, schedule.kind,
           schedule.title, schedule.details, schedule.task_prompt, schedule.timezone,
@@ -314,24 +486,24 @@ export class BotDatabase {
         ORDER BY occurrence.scheduled_at ASC
         LIMIT ?
       `),
-      claimOccurrence: this.db.prepare(`
+      claimOccurrence: prepare(`
         UPDATE schedule_occurrences SET status = 'running', started_at = @now
         WHERE id = @id AND status = 'pending'
       `),
-      recoverRunningOccurrences: this.db.prepare(`
+      recoverRunningOccurrences: prepare(`
         UPDATE schedule_occurrences SET status = 'pending', started_at = NULL
         WHERE status = 'running'
       `),
-      finishOccurrence: this.db.prepare(`
+      finishOccurrence: prepare(`
         UPDATE schedule_occurrences SET status = @status, result = @result,
           error = @error, completed_at = @now
         WHERE id = @id AND status = 'running'
       `),
-      completePastEvents: this.db.prepare(`
+      completePastEvents: prepare(`
         UPDATE scheduled_items SET status = 'completed', updated_at = @now
         WHERE kind = 'event' AND status = 'active' AND event_at <= @now
       `),
-      cancelExpiredEventReminders: this.db.prepare(`
+      cancelExpiredEventReminders: prepare(`
         UPDATE schedule_occurrences SET status = 'cancelled',
           result = 'Skipped because the event start time had passed.', completed_at = @now
         WHERE run_type = 'event_reminder' AND status IN ('pending', 'running')
@@ -340,12 +512,12 @@ export class BotDatabase {
             WHERE kind = 'event' AND status = 'active' AND event_at <= @now
           )
       `),
-      ownedActiveSchedule: this.db.prepare(`
+      ownedActiveSchedule: prepare<ScheduleRow>(`
         SELECT * FROM scheduled_items
         WHERE id = @id AND guild_id = @guildId AND owner_user_id = @userId
           AND status = 'active'
       `),
-      updateSchedule: this.db.prepare(`
+      updateSchedule: prepare(`
         UPDATE scheduled_items SET channel_id = @channelId, mention_user_id = @mentionUserId,
           title = @title, details = @details, visibility = @visibility,
           task_prompt = @taskPrompt, cron_expression = @cronExpression,
@@ -354,12 +526,12 @@ export class BotDatabase {
         WHERE id = @id AND guild_id = @guildId AND owner_user_id = @userId
           AND status = 'active'
       `),
-      cancelSchedule: this.db.prepare(`
+      cancelSchedule: prepare(`
         UPDATE scheduled_items SET status = 'cancelled', updated_at = @now
         WHERE id = @id AND guild_id = @guildId AND owner_user_id = @userId
           AND status = 'active'
       `),
-      cancelPendingOccurrences: this.db.prepare(`
+      cancelPendingOccurrences: prepare(`
         UPDATE schedule_occurrences SET status = 'cancelled', completed_at = @now
         WHERE schedule_id = @scheduleId AND status IN ('pending', 'running')
       `),
@@ -436,7 +608,7 @@ export class BotDatabase {
       if (result.changes && mustCancelPendingRuns) {
         this.statements.cancelPendingOccurrences.run({ scheduleId: schedule.id, now: updated.now });
       }
-      return result.changes === 1 ? this.statements.getSchedule.get(schedule.id) : null;
+      return result.changes === 1 ? this.statements.getSchedule.get(schedule.id) : undefined;
     });
 
     this.cancelScheduleTransaction = this.db.transaction(({ scheduleId, guildId, userId }) => {
@@ -447,7 +619,12 @@ export class BotDatabase {
     });
   }
 
-  ensureConversation({ conversationKey, guildId, channelId, ownerUserId }) {
+  ensureConversation({ conversationKey, guildId, channelId, ownerUserId }: {
+    conversationKey: string;
+    guildId: string;
+    channelId: string;
+    ownerUserId?: string;
+  }): ConversationRow | undefined {
     this.statements.createConversation.run({
       conversationKey,
       guildId,
@@ -458,7 +635,12 @@ export class BotDatabase {
     return this.statements.getConversation.get(conversationKey);
   }
 
-  addUserMessage({ conversationKey, discordMessageId, userId, content }) {
+  addUserMessage({ conversationKey, discordMessageId, userId, content }: {
+    conversationKey: string;
+    discordMessageId: string;
+    userId: string;
+    content: string;
+  }): boolean {
     const result = this.statements.insertUserMessage.run({
       conversationKey,
       discordMessageId,
@@ -469,20 +651,25 @@ export class BotDatabase {
     return result.changes === 1;
   }
 
-  addAssistantMessage(conversationKey, content) {
+  addAssistantMessage(conversationKey: string, content: string): void {
     this.statements.insertAssistantMessage.run({ conversationKey, content, now: now() });
   }
 
-  addContextMessage(conversationKey, { role, content }) {
+  addContextMessage(conversationKey: string, { role, content }: MessageRow): void {
     if (role !== "user" && role !== "assistant") throw new Error("Invalid context message role");
     this.statements.insertContextMessage.run({ conversationKey, role, content, now: now() });
   }
 
-  getConversation(conversationKey) {
+  getConversation(conversationKey: string): ConversationRow | undefined {
     return this.statements.getConversation.get(conversationKey);
   }
 
-  registerQnaThread({ threadId, guildId, parentChannelId, ownerUserId }) {
+  registerQnaThread({ threadId, guildId, parentChannelId, ownerUserId }: {
+    threadId: string;
+    guildId: string;
+    parentChannelId: string;
+    ownerUserId: string;
+  }): void {
     this.statements.insertQnaThread.run({
       threadId,
       guildId,
@@ -492,27 +679,27 @@ export class BotDatabase {
     });
   }
 
-  isQnaThread(threadId, guildId) {
+  isQnaThread(threadId: string, guildId: string): boolean {
     const thread = this.statements.getQnaThread.get(threadId);
     return Boolean(thread && thread.guild_id === guildId);
   }
 
-  setCodexThreadId(conversationKey, threadId) {
+  setCodexThreadId(conversationKey: string, threadId: string | undefined): void {
     if (!threadId) return;
     this.statements.setThreadId.run({ conversationKey, threadId, now: now() });
   }
 
-  getRecentHistory(conversationKey, excludeMessageId, limit = 12) {
+  getRecentHistory(conversationKey: string, excludeMessageId: string, limit = 12): MessageRow[] {
     return this.statements.recentMessages
       .all({ conversationKey, excludeMessageId, limit })
       .reverse();
   }
 
-  saveResearchMemory(entry) {
+  saveResearchMemory(entry: MemoryInput): void {
     this.saveMemoryTransaction(entry);
   }
 
-  findRelevantMemory(guildId, query, limit = 4) {
+  findRelevantMemory(guildId: string, query: string, limit = 4): MemoryRow[] {
     const terms = getTerms(query, MAX_QUERY_TERMS);
     if (terms.length === 0) return [];
 
@@ -523,7 +710,7 @@ export class BotDatabase {
     });
   }
 
-  createSchedule(schedule) {
+  createSchedule(schedule: ScheduleInput): ScheduleRow | undefined {
     const currentTime = now();
     this.statements.insertSchedule.run({
       id: schedule.id,
@@ -547,7 +734,7 @@ export class BotDatabase {
     return this.statements.getSchedule.get(schedule.id);
   }
 
-  listSchedules({ guildId, userId, query = "", includeInactive = false, fromAt = null, toAt = null, limit = 50 }) {
+  listSchedules({ guildId, userId, query = "", includeInactive = false, fromAt, toAt, limit = 50 }: ScheduleTimeRange): ScheduleListRow[] {
     return this.statements.listSchedules.all({
       guildId,
       userId,
@@ -560,58 +747,58 @@ export class BotDatabase {
     });
   }
 
-  getSchedule(scheduleId) {
-    return this.statements.getSchedule.get(scheduleId) ?? null;
+  getSchedule(scheduleId: string): ScheduleRow | undefined {
+    return this.statements.getSchedule.get(scheduleId);
   }
 
-  updateSchedule({ scheduleId, guildId, userId, changes }) {
+  updateSchedule({ scheduleId, guildId, userId, changes }: ScheduleLookup & { changes: ScheduleChanges }): ScheduleRow | undefined {
     const schedule = this.statements.ownedActiveSchedule.get({ id: scheduleId, guildId, userId });
-    if (!schedule) return null;
+    if (!schedule) return undefined;
     return this.updateScheduleTransaction({ schedule, changes });
   }
 
-  cancelSchedule({ scheduleId, guildId, userId }) {
+  cancelSchedule({ scheduleId, guildId, userId }: ScheduleLookup): boolean {
     return this.cancelScheduleTransaction({ scheduleId, guildId, userId });
   }
 
-  getDueCronSchedules(nowIso, limit = 50) {
+  getDueCronSchedules(nowIso: string, limit = 50): ScheduleRow[] {
     return this.statements.getDueCronSchedules.all(nowIso, limit);
   }
 
-  advanceCronSchedule({ scheduleId, scheduledAt, nextRunAt }) {
+  advanceCronSchedule({ scheduleId, scheduledAt, nextRunAt }: { scheduleId: string; scheduledAt: string; nextRunAt: string }): boolean {
     return this.advanceCronOccurrenceTransaction({ scheduleId, scheduledAt, nextRunAt });
   }
 
-  getUpcomingEvents(nowIso, throughIso, limit = 100) {
+  getUpcomingEvents(nowIso: string, throughIso: string, limit = 100): ScheduleRow[] {
     return this.statements.getUpcomingEvents.all(nowIso, throughIso, limit);
   }
 
-  addEventReminderOccurrence(scheduleId, scheduledAt) {
+  addEventReminderOccurrence(scheduleId: string, scheduledAt: string): boolean {
     return this.insertReminderOccurrenceTransaction({ scheduleId, scheduledAt });
   }
 
-  claimPendingScheduleOccurrences(limit = 100) {
+  claimPendingScheduleOccurrences(limit = 100): OccurrenceRow[] {
     return this.claimPendingOccurrencesTransaction(Math.min(limit, 200));
   }
 
-  recoverInterruptedScheduleOccurrences() {
+  recoverInterruptedScheduleOccurrences(): number {
     return this.statements.recoverRunningOccurrences.run().changes;
   }
 
-  finishScheduleOccurrence({ id, status, result = null, error = null }) {
+  finishScheduleOccurrence({ id, status, result, error }: ScheduleOccurrenceCompletion): void {
     this.statements.finishOccurrence.run({ id, status, result, error, now: now() });
   }
 
-  completePastEvents(nowIso) {
+  completePastEvents(nowIso: string): number {
     this.statements.cancelExpiredEventReminders.run({ now: nowIso });
     return this.statements.completePastEvents.run({ now: nowIso }).changes;
   }
 
-  isUsageLimited() {
+  isUsageLimited(): boolean {
     return this.statements.getState.get("usage_limited")?.value === "true";
   }
 
-  setUsageLimited(isLimited) {
+  setUsageLimited(isLimited: boolean): void {
     if (isLimited) {
       this.statements.setState.run({
         key: "usage_limited",

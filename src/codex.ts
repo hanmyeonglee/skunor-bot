@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { Codex } from "@openai/codex-sdk";
+import { Codex, type ThreadOptions } from "@openai/codex-sdk";
+import type { DiscordContext, NotificationTarget, PromptHistoryEntry, ResearchMemoryEntry } from "./types.js";
 
 export const CODEX_MODEL = "gpt-6-luna";
 export const CODEX_REASONING_EFFORT = "max";
@@ -155,7 +156,20 @@ Embed 예시 JSON: {"content":"표 앞뒤에 표시할 짧은 설명","embed":{"
 CSV 예시 JSON: {"content":"전체 표를 CSV 파일로 첨부했습니다.","csv":{"filename":"comparison.csv","content":"항목,비용,특징\\n항목 A,값,값"}}
 Embed나 CSV는 일반 본문과 별도로 전송되므로 content에는 간단한 맥락만 쓴다. 실제로 변경하지 않은 파일, 계정, 외부 서비스를 변경했다고 말하지 않는다.`;
 
-export function ensureCodexHomeConfig(codexHome) {
+export type CodexRequestOptions = {
+  codexHome: string;
+  discordToken: string;
+  guildId: string;
+  channelId: string;
+  requesterUserId: string;
+  databasePath: string;
+  timezone: string;
+  notificationChannels?: NotificationTarget[];
+  notificationUsers?: NotificationTarget[];
+  allowScheduleWrites?: boolean;
+};
+
+export function ensureCodexHomeConfig(codexHome: string): void {
   fs.mkdirSync(codexHome, { recursive: true, mode: 0o700 });
   fs.chmodSync(codexHome, 0o700);
   const configPath = path.join(codexHome, "config.toml");
@@ -184,7 +198,7 @@ export function ensureCodexHomeConfig(codexHome) {
   fs.writeFileSync(configPath, CODEX_HOME_CONFIG, { mode: 0o600, flag: "wx" });
 }
 
-export function createCodexCliEnvironment(codexHome) {
+export function createCodexCliEnvironment(codexHome: string): Record<string, string> {
   return {
     PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
     HOME: process.env.HOME || "/home/node",
@@ -193,7 +207,7 @@ export function createCodexCliEnvironment(codexHome) {
   };
 }
 
-export function installBundledSkills(codexHome) {
+export function installBundledSkills(codexHome: string): void {
   const skillsDirectory = path.join(codexHome, "skills");
   fs.mkdirSync(skillsDirectory, { recursive: true, mode: 0o700 });
   fs.chmodSync(skillsDirectory, 0o700);
@@ -206,7 +220,8 @@ export function installBundledSkills(codexHome) {
   }
 }
 
-export function createCodexRequestEnvironment(codexHome, {
+export function createCodexRequestEnvironment({
+  codexHome,
   discordToken,
   guildId,
   channelId,
@@ -216,7 +231,7 @@ export function createCodexRequestEnvironment(codexHome, {
   notificationChannels = [],
   notificationUsers = [],
   allowScheduleWrites = true,
-}) {
+}: CodexRequestOptions): Record<string, string> {
   return {
     ...createCodexCliEnvironment(codexHome),
     DISCORD_BOT_TOKEN: discordToken,
@@ -232,23 +247,25 @@ export function createCodexRequestEnvironment(codexHome, {
   };
 }
 
-export function createCodexClient({
-  codexHome,
-  discordToken,
-  guildId,
-  channelId,
-  requesterUserId,
-  databasePath,
-  timezone,
-  notificationChannels = [],
-  notificationUsers = [],
-  allowScheduleWrites = true,
-}) {
+export function createCodexClient(options: CodexRequestOptions): Codex {
+  const {
+    codexHome,
+    discordToken,
+    guildId,
+    channelId,
+    requesterUserId,
+    databasePath,
+    timezone,
+    notificationChannels = [],
+    notificationUsers = [],
+    allowScheduleWrites = true,
+  } = options;
   ensureCodexHomeConfig(codexHome);
   installBundledSkills(codexHome);
 
   return new Codex({
-    env: createCodexRequestEnvironment(codexHome, {
+    env: createCodexRequestEnvironment({
+      codexHome,
       discordToken,
       guildId,
       channelId,
@@ -265,12 +282,22 @@ export function createCodexClient({
   });
 }
 
-function clip(value, maxChars) {
+function clip(value: string, maxChars: number): string {
   if (value.length <= maxChars) return value;
   return `${value.slice(0, maxChars)}…(잘림)`;
 }
 
-export function buildCodexPrompt({ question, history = [], memory = [], discordContext = null }) {
+export function buildCodexPrompt({
+  question,
+  history = [],
+  memory = [],
+  discordContext,
+}: {
+  question: string;
+  history?: PromptHistoryEntry[];
+  memory?: ResearchMemoryEntry[];
+  discordContext?: DiscordContext;
+}): string {
   const sections = [BOT_INSTRUCTIONS];
 
   if (history.length > 0) {
@@ -304,7 +331,7 @@ export function buildCodexPrompt({ question, history = [], memory = [], discordC
   return sections.join("\n\n");
 }
 
-export function createThreadOptions() {
+export function createThreadOptions(): ThreadOptions {
   return {
     model: CODEX_MODEL,
     modelReasoningEffort: CODEX_REASONING_EFFORT,
@@ -316,16 +343,32 @@ export function createThreadOptions() {
   } as const;
 }
 
-function getCodexErrorDetails(error) {
-  const details = [];
-  const seen = new Set();
-  let current = error;
+type ErrorDetailValue = string | number | ErrorDetailRecord | undefined;
+type ErrorDetailRecord = {
+  [key: string]: ErrorDetailValue;
+  name?: string;
+  code?: string | number;
+  message?: string;
+  stderr?: string;
+  status?: string | number;
+  statusCode?: string | number;
+  exitCode?: string | number;
+  type?: string;
+  cause?: ErrorDetailValue;
+  error?: ErrorDetailValue;
+  body?: ErrorDetailRecord;
+};
+
+function getCodexErrorDetails(error: Error | ErrorDetailRecord | string): [string, string][] {
+  const details: [string, string][] = [];
+  const seen = new Set<object>();
+  let current: ErrorDetailValue = typeof error === "string" ? error : error as ErrorDetailRecord;
   for (let depth = 0; current && depth < 5; depth += 1) {
     if (typeof current === "string") {
       details.push(["message", current]);
       break;
     }
-    if ((typeof current !== "object" && typeof current !== "function") || seen.has(current)) break;
+    if (typeof current !== "object" || seen.has(current)) break;
     seen.add(current);
 
     if (typeof current.name === "string") details.push(["name", current.name]);
@@ -333,19 +376,19 @@ function getCodexErrorDetails(error) {
       const value = current[key];
       if (typeof value === "string" || typeof value === "number") details.push([key, String(value)]);
     }
-    current = current.cause ?? current.error ?? current.body?.error ?? current.body?.message ?? null;
+    current = current.cause ?? current.error ?? current.body?.error ?? current.body?.message ?? undefined;
   }
   return details;
 }
 
-function redactCodexErrorDetail(value) {
+function redactCodexErrorDetail(value: string): string {
   return value
     .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
     .replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [redacted]")
     .replace(/\b(?:sk-[A-Za-z0-9_-]{12,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b/g, "[redacted]")
     .replace(/\b(access_token|refresh_token|id_token|client_secret|api_key|authorization|password|device_code|user_code)\b(\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi, "$1$2[redacted]")
     .replace(/\b[A-Z0-9]{4}-[A-Z0-9]{4}\b/g, "[redacted-code]")
-    .replace(/https?:\/\/[^\s<>"']+/gi, (rawUrl) => {
+    .replace(/https?:\/\/[^\s<>"']+/gi, (rawUrl: string) => {
       try {
         const url = new URL(rawUrl);
         return `${url.origin}${url.pathname}${url.search || url.hash ? "?[redacted]" : ""}`;
@@ -355,7 +398,10 @@ function redactCodexErrorDetail(value) {
     });
 }
 
-export function describeCodexError(error, { redactValues = [] } = {}) {
+export function describeCodexError(
+  error: Error | ErrorDetailRecord | string,
+  { redactValues = [] }: { redactValues?: string[] } = {},
+): string {
   const details = getCodexErrorDetails(error)
     .map(([key, value]) => {
       let detail = redactCodexErrorDetail(value);
@@ -366,11 +412,11 @@ export function describeCodexError(error, { redactValues = [] } = {}) {
       }
       return `${key}=${detail}`;
     });
-  const diagnostic = details.join(" <- ") || "unknown error";
+  const diagnostic = details.join(" <- ") || "no error details";
   return diagnostic.length > 2_000 ? `${diagnostic.slice(0, 2_000)}…(잘림)` : diagnostic;
 }
 
-export function classifyCodexError(error) {
+export function classifyCodexError(error: Error | ErrorDetailRecord | string): "usage_limited" | "not_authenticated" | "thread_missing" | "request_failed" {
   const detail = getCodexErrorDetails(error).map(([, value]) => value).join(" ").toLowerCase();
 
   if (/subscription_sharing_usage_limit_exceeded|\b(?:usage|quota)\b.{0,40}\b(?:limit|exceeded|reached)\b/.test(detail)) {

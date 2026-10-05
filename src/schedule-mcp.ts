@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { CronExpressionParser } from "cron-parser";
-import { BotDatabase } from "./database.js";
+import { BotDatabase, type ScheduleChanges, type ScheduleRow } from "./database.js";
+import type { NotificationTarget } from "./types.js";
 
 process.umask(0o077);
 
@@ -89,46 +90,67 @@ const tools = [
   },
 ];
 
+type RequestContext = { userId: string; guildId: string; channelId: string; timezone: string };
+type TargetOption = NotificationTarget;
+type ToolArgValue = string | number | boolean | object | undefined;
+type ToolArgs = Record<string, ToolArgValue>;
+type RpcId = string | number | null | undefined;
+type RpcError = { code: number; message: string };
+type RpcRequest = {
+  jsonrpc?: string;
+  id?: RpcId;
+  method?: string;
+  params?: Record<string, ToolArgValue>;
+};
+type RpcResponse = {
+  jsonrpc: "2.0";
+  id?: RpcId;
+  result?: object;
+  error?: RpcError;
+} | undefined;
+
 let database: BotDatabase;
 
-function getRequestContext() {
-  const context = {
-    userId: process.env.SCHEDULE_REQUESTER_ID,
-    guildId: process.env.SCHEDULE_GUILD_ID,
-    channelId: process.env.SCHEDULE_CHANNEL_ID,
-    timezone: process.env.SCHEDULE_TIME_ZONE || "Asia/Seoul",
-  };
-  if (!context.userId || !context.guildId || !context.channelId) {
+function getRequestContext(): RequestContext {
+  const userId = process.env.SCHEDULE_REQUESTER_ID;
+  const guildId = process.env.SCHEDULE_GUILD_ID;
+  const channelId = process.env.SCHEDULE_CHANNEL_ID;
+  const timezone = process.env.SCHEDULE_TIME_ZONE || "Asia/Seoul";
+  if (!userId || !guildId || !channelId) {
     throw new Error("Trusted schedule request context is missing.");
   }
-  validateTimezone(context.timezone);
-  return context;
+  validateTimezone(timezone);
+  return { userId, guildId, channelId, timezone };
 }
 
-function getTargetOptions(environmentVariable) {
-  let options;
+function getTargetOptions(environmentVariable: string): TargetOption[] {
+  let options: Array<{ id?: string; name?: string }>;
   try {
-    options = JSON.parse(process.env[environmentVariable] || "[]");
+    options = JSON.parse(process.env[environmentVariable] || "[]") as Array<{ id?: string; name?: string }>;
   } catch {
     throw new Error(`${environmentVariable} must contain a JSON array.`);
   }
   if (!Array.isArray(options)) throw new Error(`${environmentVariable} must contain a JSON array.`);
-  return options.filter((option) => (
-    option
-    && typeof option.id === "string"
+  return options.filter((option): option is TargetOption => (
+    typeof option.id === "string"
     && /^\d{17,20}$/u.test(option.id)
     && typeof option.name === "string"
-    && option.name.trim()
+    && Boolean(option.name.trim())
   ));
 }
 
-function resolveTargetId(value, options, field, { mentionPattern = null, selfId = null } = {}) {
+function resolveTargetId(
+  value: ToolArgValue,
+  options: TargetOption[],
+  field: string,
+  { mentionPattern, selfId }: { mentionPattern?: RegExp; selfId?: string } = {},
+): string {
   const target = cleanText(value, field, 200);
   if (selfId && target.toLocaleLowerCase("en-US") === "self") return selfId;
 
-  const mentionedId = mentionPattern ? target.match(mentionPattern)?.[1] : null;
+  const mentionedId = mentionPattern ? target.match(mentionPattern)?.[1] : undefined;
   const query = mentionedId || target.replace(/^[@#]/u, "").trim();
-  const matches = options.filter((option) => (
+  const matches = options.filter((option: TargetOption) => (
     option.id === query
     || option.name.trim().toLocaleLowerCase("en-US") === query.toLocaleLowerCase("en-US")
   ));
@@ -137,7 +159,7 @@ function resolveTargetId(value, options, field, { mentionPattern = null, selfId 
   throw new Error(`${field} must match an available Discord target in the current request context.`);
 }
 
-function resolveNotificationChannel(value, context) {
+function resolveNotificationChannel(value: ToolArgValue, context: RequestContext): string {
   if (value === undefined) return context.channelId;
   if (typeof value === "string" && value.trim().toLocaleLowerCase("en-US") === "current") {
     return context.channelId;
@@ -150,7 +172,7 @@ function resolveNotificationChannel(value, context) {
   );
 }
 
-function resolveMentionUser(value, context) {
+function resolveMentionUser(value: ToolArgValue, context: RequestContext): string {
   if (value === undefined) return context.userId;
   if (typeof value === "string" && value.trim().toLocaleLowerCase("en-US") === "self") {
     return context.userId;
@@ -169,7 +191,7 @@ function ensureWritesAllowed() {
   }
 }
 
-function validateTimezone(timezone) {
+function validateTimezone(timezone: ToolArgValue): string {
   if (typeof timezone !== "string" || timezone.length > 100) {
     throw new Error("timezone must be an IANA timezone name.");
   }
@@ -181,19 +203,21 @@ function validateTimezone(timezone) {
   return timezone;
 }
 
-function cleanText(value, field, maxLength, { required = true } = {}) {
+function cleanText(value: ToolArgValue, field: string, maxLength: number, options?: { required?: true }): string;
+function cleanText(value: ToolArgValue, field: string, maxLength: number, options: { required: false }): string | undefined;
+function cleanText(value: ToolArgValue, field: string, maxLength: number, { required = true }: { required?: boolean } = {}): string | undefined {
   if (value === undefined || value === null) {
     if (required) throw new Error(`${field} is required.`);
-    return null;
+    return undefined;
   }
   if (typeof value !== "string") throw new Error(`${field} must be text.`);
   const result = value.trim();
   if (required && !result) throw new Error(`${field} cannot be empty.`);
   if (result.length > maxLength) throw new Error(`${field} must be ${maxLength} characters or fewer.`);
-  return result || null;
+  return result || undefined;
 }
 
-function normalizeVisibility(value) {
+function normalizeVisibility(value: ToolArgValue): "personal" | "shared" {
   if (value === undefined || value === null) return "personal";
   if (value !== "personal" && value !== "shared") {
     throw new Error("visibility must be personal or shared.");
@@ -201,7 +225,7 @@ function normalizeVisibility(value) {
   return value;
 }
 
-function normalizeCronExpression(expression, timezone, currentDate = new Date()) {
+function normalizeCronExpression(expression: ToolArgValue, timezone: string, currentDate = new Date()): { expression: string; nextRunAt: string } {
   if (typeof expression !== "string" || expression.trim().split(/\s+/u).length !== 5) {
     throw new Error("cronExpression must have exactly five fields: minute hour day-of-month month day-of-week.");
   }
@@ -213,7 +237,7 @@ function normalizeCronExpression(expression, timezone, currentDate = new Date())
   }
 }
 
-function normalizeStartTime(value) {
+function normalizeStartTime(value: ToolArgValue): string {
   if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})$/u.test(value)) {
     throw new Error("startsAt must be an ISO 8601 date/time with an explicit timezone, such as 2026-10-10T19:30:00+09:00.");
   }
@@ -222,8 +246,8 @@ function normalizeStartTime(value) {
   return date.toISOString();
 }
 
-function scheduleSummary(schedule) {
-  const excerpt = (value, limit) => {
+function scheduleSummary(schedule: ScheduleRow & { latest_result?: string; latest_run_at?: string }): object {
+  const excerpt = (value: string | undefined, limit: number): string | undefined => {
     if (typeof value !== "string" || value.length <= limit) return value;
     return `${value.slice(0, limit)}…(잘림)`;
   };
@@ -250,17 +274,17 @@ function scheduleSummary(schedule) {
   };
 }
 
-function toolText(value) {
-  return { content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] };
+function toolText(value: string | object): { content: [{ type: "text"; text: string }] } {
+  return { content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, undefined, 2) }] };
 }
 
-function createScheduledTask(args) {
+function createScheduledTask(args: ToolArgs): { content: [{ type: "text"; text: string }] } {
   ensureWritesAllowed();
   const context = getRequestContext();
   const title = cleanText(args.title, "title", 160);
   const taskPrompt = cleanText(args.taskPrompt, "taskPrompt", 5_000);
-  const timezone = validateTimezone(args.timezone || context.timezone);
-  const { expression, nextRunAt } = normalizeCronExpression(args.cronExpression, timezone);
+  const timezone = validateTimezone(typeof args.timezone === "string" ? args.timezone : context.timezone);
+  const { expression, nextRunAt } = normalizeCronExpression(cleanText(args.cronExpression, "cronExpression", 200), timezone);
   const schedule = database.createSchedule({
     id: randomUUID(),
     guildId: context.guildId,
@@ -275,15 +299,16 @@ function createScheduledTask(args) {
     timezone,
     nextRunAt,
   });
+  if (!schedule) throw new Error("The new schedule could not be loaded.");
   return toolText({ created: true, schedule: scheduleSummary(schedule) });
 }
 
-function createEvent(args) {
+function createEvent(args: ToolArgs): { content: [{ type: "text"; text: string }] } {
   ensureWritesAllowed();
   const context = getRequestContext();
   const title = cleanText(args.title, "title", 160);
   const details = cleanText(args.details, "details", 2_000, { required: false });
-  const timezone = validateTimezone(args.timezone || context.timezone);
+  const timezone = validateTimezone(typeof args.timezone === "string" ? args.timezone : context.timezone);
   const eventAt = normalizeStartTime(args.startsAt);
   const schedule = database.createSchedule({
     id: randomUUID(),
@@ -300,14 +325,16 @@ function createEvent(args) {
     timezone,
     status: Date.parse(eventAt) <= Date.now() ? "completed" : "active",
   });
+  if (!schedule) throw new Error("The new event could not be loaded.");
   return toolText({ created: true, schedule: scheduleSummary(schedule) });
 }
 
-function listSchedules(args) {
+function listSchedules(args: ToolArgs): { content: [{ type: "text"; text: string }] } {
   const context = getRequestContext();
   const query = cleanText(args.query, "query", 200, { required: false }) || "";
-  const fromAt = args.fromAt === undefined ? null : normalizeStartTime(args.fromAt);
-  const toAt = args.toAt === undefined ? null : normalizeStartTime(args.toAt);
+  const fromAt = args.fromAt === undefined ? undefined : normalizeStartTime(args.fromAt);
+  const toAt = args.toAt === undefined ? undefined : normalizeStartTime(args.toAt);
+  const limit = typeof args.limit === "number" ? args.limit : 50;
   const schedules = database.listSchedules({
     guildId: context.guildId,
     userId: context.userId,
@@ -315,12 +342,12 @@ function listSchedules(args) {
     includeInactive: args.includeInactive === true,
     fromAt,
     toAt,
-    limit: args.limit ?? 50,
+    limit,
   });
   return toolText({ schedules: schedules.map(scheduleSummary), count: schedules.length });
 }
 
-function updateSchedule(args) {
+function updateSchedule(args: ToolArgs): { content: [{ type: "text"; text: string }] } {
   ensureWritesAllowed();
   const context = getRequestContext();
   const scheduleId = cleanText(args.scheduleId, "scheduleId", 100);
@@ -329,7 +356,7 @@ function updateSchedule(args) {
     throw new Error("Active schedule not found or not owned by the current requester.");
   }
 
-  const changes: Record<string, any> = {};
+  const changes: ScheduleChanges = {};
   if (args.title !== undefined) changes.title = cleanText(args.title, "title", 160);
   if (args.visibility !== undefined) changes.visibility = normalizeVisibility(args.visibility);
   if (args.timezone !== undefined) changes.timezone = validateTimezone(args.timezone);
@@ -358,9 +385,10 @@ function updateSchedule(args) {
       throw new Error("taskPrompt and cronExpression can only be changed on a recurring task.");
     }
     if (args.details !== undefined) changes.details = cleanText(args.details, "details", 2_000, { required: false });
-    if (args.startsAt !== undefined) changes.event_at = normalizeStartTime(args.startsAt);
     if (args.startsAt !== undefined) {
-      changes.status = Date.parse(changes.event_at) <= Date.now() ? "completed" : "active";
+      const eventAt = normalizeStartTime(args.startsAt);
+      changes.event_at = eventAt;
+      changes.status = Date.parse(eventAt) <= Date.now() ? "completed" : "active";
     }
   }
 
@@ -375,7 +403,7 @@ function updateSchedule(args) {
   return toolText({ updated: true, schedule: scheduleSummary(updated) });
 }
 
-function cancelSchedule(args) {
+function cancelSchedule(args: ToolArgs): { content: [{ type: "text"; text: string }] } {
   ensureWritesAllowed();
   const context = getRequestContext();
   const scheduleId = cleanText(args.scheduleId, "scheduleId", 100);
@@ -388,7 +416,7 @@ function cancelSchedule(args) {
   return toolText({ cancelled: true, scheduleId });
 }
 
-function handleToolCall(name, args) {
+function handleToolCall(name: string | undefined, args: ToolArgs): { content: [{ type: "text"; text: string }] } {
   if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("Tool arguments must be a JSON object.");
   switch (name) {
     case "create_scheduled_task": return createScheduledTask(args);
@@ -400,11 +428,11 @@ function handleToolCall(name, args) {
   }
 }
 
-function handleRequest(request) {
+function handleRequest(request: RpcRequest): RpcResponse {
   if (!request || request.jsonrpc !== "2.0" || typeof request.method !== "string") {
     return { jsonrpc: "2.0", id: request?.id ?? null, error: { code: -32600, message: "Invalid JSON-RPC request" } };
   }
-  if (request.method === "notifications/initialized" || request.method === "notifications/cancelled") return null;
+  if (request.method === "notifications/initialized" || request.method === "notifications/cancelled") return undefined;
   if (request.method === "ping") return { jsonrpc: "2.0", id: request.id, result: {} };
   if (request.method === "initialize") {
     return {
@@ -423,14 +451,19 @@ function handleRequest(request) {
   }
   if (request.method === "tools/call") {
     try {
-      const result = handleToolCall(request.params?.name, request.params?.arguments ?? {});
+      const args = request.params?.arguments ?? {};
+      if (!args || typeof args !== "object" || Array.isArray(args)) {
+        throw new Error("Tool arguments must be a JSON object.");
+      }
+      const requestedName = request.params?.name;
+      const result = handleToolCall(typeof requestedName === "string" ? requestedName : undefined, args as ToolArgs);
       return { jsonrpc: "2.0", id: request.id, result };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return { jsonrpc: "2.0", id: request.id, result: { ...toolText(message), isError: true } };
     }
   }
-  if (request.id === undefined) return null;
+  if (request.id === undefined) return undefined;
   return { jsonrpc: "2.0", id: request.id, error: { code: -32601, message: `Method not found: ${request.method}` } };
 }
 

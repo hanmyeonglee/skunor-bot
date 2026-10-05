@@ -1,22 +1,34 @@
 import http from "node:http";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import type { Server } from "node:http";
 import { CronExpressionParser } from "cron-parser";
+import type { Thread } from "@openai/codex-sdk";
 import {
   ActionRowBuilder,
   AttachmentBuilder,
   ButtonBuilder,
   ButtonStyle,
+  type ButtonInteraction,
+  type ChatInputCommandInteraction,
   Client,
   EmbedBuilder,
   GatewayIntentBits,
+  type AnyThreadChannel,
+  type GuildTextBasedChannel,
+  type Interaction,
   MessageFlags,
+  type Message,
+  type MessageMentionOptions,
+  type MessageSnapshot,
+  type ModalSubmitInteraction,
   ModalBuilder,
   PermissionFlagsBits,
   SlashCommandBuilder,
   TextInputBuilder,
   TextInputStyle,
   type MessageCreateOptions,
+  type TextBasedChannel,
 } from "discord.js";
 import { loadConfig } from "./config.js";
 import { BotDatabase } from "./database.js";
@@ -30,7 +42,10 @@ import {
   installBundledSkills,
   describeCodexError,
   MCP_OAUTH_SERVER_NAMES,
+  type CodexRequestOptions,
 } from "./codex.js";
+import type { DiscordContext, NotificationTarget, PromptHistoryEntry } from "./types.js";
+import type { OccurrenceRow, ScheduleRow } from "./database.js";
 
 process.umask(0o077);
 
@@ -48,6 +63,117 @@ const MCP_LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_CSV_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 const STRUCTURED_RESPONSE_PATTERN = /(?:^|\r?\n)\[\[SKUNOR_RESPONSE_V1\]\]\s*\r?\n([\s\S]*?)\r?\n\[\[\/SKUNOR_RESPONSE_V1\]\](?=\r?\n|$)/;
 
+type FenceState = { character: string; length: number; openingLine: string; closingLine: string };
+type EmbedFieldData = { name: string; value: string; inline: boolean };
+type EmbedData = { title: string; description: string; fields: EmbedFieldData[] };
+type CsvData = { filename: string; content: string };
+type PreparedDiscordResponse = {
+  kind: "prepared_discord_response";
+  content: string;
+  historyText: string;
+  embed?: EmbedData;
+  csv?: CsvData;
+};
+type ProgressPlanItem = { text: string; completed: boolean };
+type RequestProgress = {
+  setPlan(items: readonly ProgressPlanItem[]): void;
+  setActivity(activity: string | undefined): void;
+  finish(): Promise<void>;
+};
+type CodexJob = () => Promise<void>;
+type ProcessRequestOptions = {
+  sourceMessage: Message;
+  question: string;
+  quotaRecheck?: boolean;
+  conversationKey: string;
+  guildId: string;
+  progress?: RequestProgress;
+  requesterUserId?: string;
+  initialHistory?: PromptHistoryEntry[];
+};
+type InitialQnaRequestOptions = {
+  sourceMessage: Message;
+  question: string;
+  conversationKey: string;
+  guildId: string;
+  requesterUserId: string;
+  initialHistory: PromptHistoryEntry[];
+};
+type LinkedMessageLike = {
+  author?: { globalName?: string; username?: string; name?: string };
+  content?: string;
+  embeds?: Iterable<{
+    title?: string;
+    description?: string;
+    fields?: Iterable<{ name?: string; value?: string }>;
+    url?: string;
+    image?: { url: string };
+    thumbnail?: { url: string };
+  }> | { values(): IterableIterator<{
+    title?: string;
+    description?: string;
+    fields?: Iterable<{ name?: string; value?: string }>;
+    url?: string;
+    image?: { url: string };
+    thumbnail?: { url: string };
+  }> };
+  attachments?: Iterable<{
+    name?: string;
+    filename?: string;
+    contentType?: string;
+    content_type?: string;
+    size?: number;
+    url?: string;
+  }> | { values(): IterableIterator<{
+    name?: string;
+    filename?: string;
+    contentType?: string;
+    content_type?: string;
+    size?: number;
+    url?: string;
+  }> };
+  guildId?: string;
+  guild_id?: string;
+  channelId?: string;
+  channel_id?: string;
+  id?: string;
+};
+type LinkedMessageOptions = {
+  label: string;
+  currentGuildId: string;
+  sourceGuildIdFallback?: string;
+  fallbackChannelId?: string;
+  fallbackMessageId?: string;
+};
+type DiscordRequestSource = {
+  author: { id: string; bot?: boolean; globalName?: string; username?: string };
+  channelId: string;
+  guildId?: string;
+  guild?: Message["guild"];
+  channel?: Message["channel"];
+  member?: Message["member"];
+  mentions?: Message["mentions"];
+};
+type McpAuthorization = { authorizationUrl: string; state: string; redirect: URL };
+type McpProcessResult = { error?: Error; code?: number };
+type McpLoginPhase = "starting" | "waiting" | "exchanging";
+type McpLoginSession = {
+  id: string;
+  serverName: string;
+  ownerUserId: string;
+  commandInteraction: ChatInputCommandInteraction;
+  callbackInteraction?: ModalSubmitInteraction;
+  authorization?: McpAuthorization;
+  child?: ChildProcessWithoutNullStreams;
+  timeout?: NodeJS.Timeout;
+  finalized: boolean;
+  phase: McpLoginPhase;
+  closedResult?: McpProcessResult;
+};
+type McpLoginOutcome = { kind: "success" | "expired" | "cancelled" } | { kind: "failed"; error?: Error; code?: number };
+type StructuredValue = string | number | boolean | null | StructuredValue[] | { [key: string]: StructuredValue };
+type StructuredObject = { [key: string]: StructuredValue };
+
 const config = loadConfig();
 ensureCodexHomeConfig(config.codexHome);
 installBundledSkills(config.codexHome);
@@ -64,28 +190,32 @@ const client = new Client({
 let queueTail = Promise.resolve();
 let queuedJobCount = 0;
 let shuttingDown = false;
-let healthServer;
-let activeJob = null;
+let healthServer: Server | undefined;
+let activeJob: Promise<void> | undefined;
 let loginRequested = false;
-let activeLoginChild = null;
-let activeMcpLogin = null;
-let schedulePollTimer = null;
+let activeLoginChild: ChildProcess | undefined;
+let activeMcpLogin: McpLoginSession | undefined;
+let schedulePollTimer: NodeJS.Timeout | undefined;
 let schedulePollRunning = false;
 
-function getScheduleNotificationTargets(message) {
-  const channels = new Map();
+function getScheduleNotificationTargets(message: DiscordRequestSource | Message): { channels: NotificationTarget[]; users: NotificationTarget[] } {
+  const channels = new Map<string, NotificationTarget>();
   const channelCandidates = [
     ...(message.guild?.channels?.cache?.values?.() ?? []),
     message.channel,
   ];
   for (const channel of channelCandidates) {
+    if (!client.user) continue;
     if (
       !channel?.id
-      || channel.guildId !== config.allowedGuildId
       || !channel.isTextBased?.()
+      || !("guildId" in channel)
+      || channel.guildId !== config.allowedGuildId
+      || !("send" in channel)
       || typeof channel.send !== "function"
     ) continue;
     if (channel.id !== message.channelId) {
+      if (!("permissionsFor" in channel)) continue;
       const permissions = channel.permissionsFor?.(client.user);
       const sendPermission = channel.isThread?.()
         ? PermissionFlagsBits.SendMessagesInThreads
@@ -97,20 +227,20 @@ function getScheduleNotificationTargets(message) {
     }
     channels.set(channel.id, {
       id: channel.id,
-      name: channel.name || channel.id,
+      name: "name" in channel && typeof channel.name === "string" ? channel.name : channel.id,
     });
   }
 
-  const users = new Map();
+  const users = new Map<string, NotificationTarget>();
   const requesterName = message.member?.displayName
     || message.author?.globalName
     || message.author?.username;
   if (!message.author?.bot && message.author?.id && requesterName) {
     users.set(message.author.id, { id: message.author.id, name: requesterName });
   }
-  for (const user of message.mentions?.users?.values?.() ?? []) {
+  for (const user of message.mentions?.users.values() ?? []) {
     if (user.bot) continue;
-    const displayName = message.mentions.members?.get(user.id)?.displayName
+    const displayName = message.mentions?.members?.get(user.id)?.displayName
       || user.globalName
       || user.username;
     users.set(user.id, { id: user.id, name: displayName });
@@ -122,7 +252,7 @@ function getScheduleNotificationTargets(message) {
   };
 }
 
-function log(event, fields = {}) {
+function log(event: string, fields: Record<string, string | number | boolean | object | undefined> = {}): void {
   console.log(JSON.stringify({
     timestamp: new Date().toISOString(),
     event,
@@ -130,27 +260,29 @@ function log(event, fields = {}) {
   }));
 }
 
-function cleanRequestContent(content, botId) {
+function cleanRequestContent(content: string, botId: string): string {
   return content
     .replace(new RegExp(`<@!?${botId}>`, "g"), " ")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function collectionValues(value) {
+function collectionValues<T>(value: Iterable<T> | { values(): IterableIterator<T> } | undefined): T[] {
   if (Array.isArray(value)) return value;
-  if (value && typeof value.values === "function") return [...value.values()];
-  if (value && typeof value === "object") return Object.values(value);
+  if (value && "values" in value && typeof value.values === "function") {
+    return [...value.values()];
+  }
+  if (value) return [...value as Iterable<T>];
   return [];
 }
 
-function describeLinkedMessage(source, {
+function describeLinkedMessage(source: LinkedMessageLike, {
   label,
   currentGuildId,
   sourceGuildIdFallback = currentGuildId,
-  fallbackChannelId = null,
-  fallbackMessageId = null,
-}) {
+  fallbackChannelId,
+  fallbackMessageId,
+}: LinkedMessageOptions): string {
   const lines = [`[${label}]`];
   const author = source?.author;
   const authorName = author?.globalName || author?.username || author?.name;
@@ -176,7 +308,7 @@ function describeLinkedMessage(source, {
     const name = attachment?.name || attachment?.filename || "이름 없는 첨부 파일";
     const metadata = [
       attachment?.contentType || attachment?.content_type,
-      Number.isFinite(attachment?.size) ? `${attachment.size} bytes` : null,
+      Number.isFinite(attachment?.size) ? `${attachment.size} bytes` : undefined,
       attachment?.url,
     ].filter(Boolean);
     lines.push(`첨부 파일: ${name}${metadata.length ? ` (${metadata.join("; ")})` : ""}`);
@@ -191,19 +323,19 @@ function describeLinkedMessage(source, {
   return lines.join("\n");
 }
 
-async function getLinkedMessageContext(message) {
+async function getLinkedMessageContext(message: Message): Promise<string> {
   const reference = message.reference;
-  const snapshots = collectionValues(message.messageSnapshots);
+  const currentGuildId = message.guildId ?? "";
+  const snapshots = [...message.messageSnapshots.values()];
   const sections = snapshots.map((snapshot, index) => {
     // Discord's API wraps snapshot fields in `message`; tolerate library versions
     // that expose the fields directly as well.
-    const source = snapshot?.message && typeof snapshot.message === "object"
-      ? snapshot.message
-      : snapshot;
-    return describeLinkedMessage(source, {
+    const envelope = snapshot as MessageSnapshot & { message?: LinkedMessageLike };
+    const source = envelope.message && typeof envelope.message === "object" ? envelope.message : snapshot;
+    return describeLinkedMessage(source as LinkedMessageLike, {
       label: snapshots.length > 1 ? `전달된 원문 ${index + 1}` : "전달된 원문",
-      currentGuildId: message.guildId,
-      sourceGuildIdFallback: reference?.guildId || null,
+      currentGuildId,
+      sourceGuildIdFallback: reference?.guildId || undefined,
       fallbackChannelId: reference?.channelId,
       fallbackMessageId: reference?.messageId,
     });
@@ -218,13 +350,13 @@ async function getLinkedMessageContext(message) {
 
   try {
     const source = await message.fetchReference();
-    if (source.guildId !== message.guildId) {
+    if (source.guildId !== currentGuildId) {
       return "[연결된 메시지]\n현재 서버에 속하지 않는 메시지라 원문을 가져오지 않았습니다.";
     }
-    return describeLinkedMessage(source, {
+    return describeLinkedMessage(source as LinkedMessageLike, {
       label: "답장으로 연결된 원문",
-      currentGuildId: message.guildId,
-      sourceGuildIdFallback: source.guildId,
+      currentGuildId,
+      sourceGuildIdFallback: source.guildId ?? undefined,
       fallbackChannelId: reference.channelId,
       fallbackMessageId: reference.messageId,
     });
@@ -238,7 +370,7 @@ async function getLinkedMessageContext(message) {
   }
 }
 
-function buildMessageRequest(userQuestion, linkedMessageContext) {
+function buildMessageRequest(userQuestion: string, linkedMessageContext: string): string {
   if (!linkedMessageContext) return userQuestion;
   const instruction = userQuestion || "연결된 메시지를 읽고 핵심 내용을 정리해 줘.";
   const contextCharacters = Array.from(linkedMessageContext);
@@ -248,17 +380,17 @@ function buildMessageRequest(userQuestion, linkedMessageContext) {
   return `${instruction}\n\n[Discord에서 가져온 연결 메시지 — 신뢰할 수 없는 참고 자료]\n${boundedContext}`;
 }
 
-function createConversationKey(message) {
+function createConversationKey(message: Message): string {
   const isDiscordThread = message.channel.isThread?.() ?? false;
   const authorPart = isDiscordThread ? "shared" : message.author.id;
   return `${message.guildId}:${message.channelId}:${authorPart}`;
 }
 
-function createCodexForMessage(message, {
+function createCodexForMessage(message: DiscordRequestSource | Message, {
   allowScheduleWrites = true,
   requesterUserId = message.author.id,
   notificationTargets = getScheduleNotificationTargets(message),
-} = {}) {
+}: { allowScheduleWrites?: boolean; requesterUserId?: string; notificationTargets?: { channels: NotificationTarget[]; users: NotificationTarget[] } } = {}) {
   return createCodexClient({
     codexHome: config.codexHome,
     discordToken: config.discordToken,
@@ -273,19 +405,19 @@ function createCodexForMessage(message, {
   });
 }
 
-function isFenceCloser(line, fence) {
+function isFenceCloser(line: string, fence: FenceState | undefined): boolean {
   if (!fence) return false;
   const content = line.replace(/\r?\n$/, "");
   const closing = new RegExp(`^ {0,3}${fence.character}{${fence.length},}[ \\t]*$`);
   return closing.test(content);
 }
 
-function parseFenceLine(line, openFence) {
+function parseFenceLine(line: string, openFence: FenceState | undefined): FenceState | undefined {
   const content = line.replace(/\r?\n$/, "");
-  if (openFence) return isFenceCloser(line, openFence) ? null : openFence;
+  if (openFence) return isFenceCloser(line, openFence) ? undefined : openFence;
 
   const opening = content.match(/^( {0,3})(`{3,}|~{3,})(.*)$/);
-  if (!opening || (opening[2][0] === "`" && opening[3].includes("`"))) return null;
+  if (!opening || (opening[2][0] === "`" && opening[3].includes("`"))) return undefined;
   return {
     character: opening[2][0],
     length: opening[2].length,
@@ -294,7 +426,7 @@ function parseFenceLine(line, openFence) {
   };
 }
 
-function splitPoint(value, limit) {
+function splitPoint(value: string, limit: number): number {
   const minimum = Math.floor(limit * 0.55);
   const newlineAt = value.lastIndexOf("\n", limit - 1);
   if (newlineAt >= minimum) return newlineAt + 1;
@@ -315,20 +447,20 @@ function splitPoint(value, limit) {
   return Math.max(1, point);
 }
 
-function splitForDiscord(text, maxLength) {
+function splitForDiscord(text: string, maxLength: number): string[] {
   const parts = [];
   const lines = text.match(/[^\n]*\n|[^\n]+$/g) || [];
   let current = "";
-  let openFence = null;
+  let openFence: FenceState | undefined;
 
-  const fenceClosing = (fence, content) => {
+  const fenceClosing = (fence: FenceState | undefined, content: string): string => {
     if (!fence) return "";
     const newline = content.endsWith("\n") || content.endsWith("\r") ? "" : "\n";
     return `${newline}${fence.closingLine}`;
   };
-  const maxFenceClosingLength = (fence) => (fence ? fence.closingLine.length + 1 : 0);
+  const maxFenceClosingLength = (fence: FenceState | undefined): number => (fence ? fence.closingLine.length + 1 : 0);
 
-  const reopenFence = (fence) => (fence ? `${fence.openingLine}\n` : "");
+  const reopenFence = (fence: FenceState | undefined): string => (fence ? `${fence.openingLine}\n` : "");
 
   const flush = () => {
     if (!current) return;
@@ -349,7 +481,7 @@ function splitForDiscord(text, maxLength) {
     // A synthetic closer in the previous chunk already represents this source closer.
     if (openFence && !nextFence && isFenceCloser(line, openFence)) {
       flush();
-      openFence = null;
+      openFence = undefined;
       current = "";
       continue;
     }
@@ -403,18 +535,16 @@ function splitForDiscord(text, maxLength) {
   return parts.length > 0 ? parts : ["(빈 답변)"];
 }
 
-function plainDiscordResponse(content) {
+function plainDiscordResponse(content: string): PreparedDiscordResponse {
   const boundedContent = boundAnswer(content || "(빈 답변)");
   return {
     kind: "prepared_discord_response",
     content: boundedContent,
-    embed: null,
-    csv: null,
     historyText: boundedContent,
   };
 }
 
-function flattenEmbedForHistory(embed) {
+function flattenEmbedForHistory(embed: EmbedData): string {
   return [
     embed.title,
     embed.description,
@@ -422,7 +552,7 @@ function flattenEmbedForHistory(embed) {
   ].filter(Boolean).join("\n\n");
 }
 
-function sanitizeCsvFilename(filename) {
+function sanitizeCsvFilename(filename: string | undefined): string {
   let safeFilename = String(filename || "table.csv")
     .replace(/[\\/:\u0000-\u001f\u007f]/g, "_")
     .trim()
@@ -432,18 +562,20 @@ function sanitizeCsvFilename(filename) {
   return safeFilename;
 }
 
-function validateEmbedPayload(embed) {
-  if (!embed || typeof embed !== "object" || Array.isArray(embed)) return null;
-  const title = embed.title ?? "";
-  const description = embed.description ?? "";
-  const rawFields = embed.fields ?? [];
-  if (typeof title !== "string" || typeof description !== "string" || !Array.isArray(rawFields)) return null;
+function validateEmbedPayload(embed: StructuredValue | undefined): EmbedData | undefined {
+  if (!embed || typeof embed !== "object" || Array.isArray(embed)) return undefined;
+  const record = embed as StructuredObject;
+  const title = record.title ?? "";
+  const description = record.description ?? "";
+  const rawFields = record.fields ?? [];
+  if (typeof title !== "string" || typeof description !== "string" || !Array.isArray(rawFields)) return undefined;
 
-  const fields = [];
-  for (const field of rawFields) {
-    if (!field || typeof field !== "object" || Array.isArray(field)) return null;
-    if (typeof field.name !== "string" || typeof field.value !== "string") return null;
-    if (!field.name.trim() || !field.value.trim()) return null;
+  const fields: EmbedFieldData[] = [];
+  for (const fieldValue of rawFields) {
+    if (!fieldValue || typeof fieldValue !== "object" || Array.isArray(fieldValue)) return undefined;
+    const field = fieldValue as StructuredObject;
+    if (typeof field.name !== "string" || typeof field.value !== "string") return undefined;
+    if (!field.name.trim() || !field.value.trim()) return undefined;
     fields.push({
       name: field.name,
       value: field.value,
@@ -457,13 +589,13 @@ function validateEmbedPayload(embed) {
     || fields.some((field) => field.name.length > 256 || field.value.length > 1_024)
     || characterCount > 6_000
     || (!title && !description && fields.length === 0)) {
-    return null;
+    return undefined;
   }
 
   return { title, description, fields };
 }
 
-function makePreparedDiscordResponse({ content, embed = null, csv = null }) {
+function makePreparedDiscordResponse({ content, embed, csv }: { content: string; embed?: EmbedData; csv?: CsvData }): PreparedDiscordResponse {
   const boundedContent = boundAnswer(content || "");
   const embedText = embed ? flattenEmbedForHistory(embed) : "";
   const csvText = csv ? `CSV 첨부: ${csv.filename}` : "";
@@ -471,54 +603,59 @@ function makePreparedDiscordResponse({ content, embed = null, csv = null }) {
   return {
     kind: "prepared_discord_response",
     content: boundedContent,
-    embed,
-    csv,
+    ...(embed ? { embed } : {}),
+    ...(csv ? { csv } : {}),
     historyText,
   };
 }
 
-function prepareDiscordResponse(answer) {
-  if (answer?.kind === "prepared_discord_response") return answer;
-  const rawAnswer = typeof answer === "string" ? answer : String(answer ?? "");
+function prepareDiscordResponse(answer: string | PreparedDiscordResponse): PreparedDiscordResponse {
+  if (typeof answer !== "string") return answer;
+  const rawAnswer = answer;
   const safeAnswer = rawAnswer.replaceAll(config.discordToken, "[Discord bot token redacted]");
   const match = safeAnswer.match(STRUCTURED_RESPONSE_PATTERN);
   if (!match) return plainDiscordResponse(safeAnswer);
   const surroundingText = [
-    safeAnswer.slice(0, match.index),
-    safeAnswer.slice(match.index + match[0].length),
+    safeAnswer.slice(0, match.index ?? 0),
+    safeAnswer.slice((match.index ?? 0) + match[0].length),
   ].join("").trim();
 
-  let payload;
+  let payload: StructuredValue;
   try {
-    payload = JSON.parse(match[1]);
+    payload = JSON.parse(match[1]) as StructuredValue;
   } catch {
     return plainDiscordResponse("표 응답을 처리하지 못했습니다. 표 내용을 목록 형식으로 다시 요청해 주세요.");
   }
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     return plainDiscordResponse("표 응답을 처리하지 못했습니다. 표 내용을 목록 형식으로 다시 요청해 주세요.");
   }
+  const payloadObject = payload as StructuredObject;
 
   const content = [
     surroundingText,
-    typeof payload.content === "string" ? payload.content : "",
+    typeof payloadObject.content === "string" ? payloadObject.content : "",
   ].filter(Boolean).join("\n\n");
-  const hasEmbed = payload.embed !== undefined && payload.embed !== null;
-  const hasCsv = payload.csv !== undefined && payload.csv !== null;
+  const hasEmbed = Boolean(payloadObject.embed);
+  const hasCsv = Boolean(payloadObject.csv);
   if (hasEmbed && hasCsv) {
     return plainDiscordResponse(`${content}\n\nEmbed와 CSV를 함께 표시할 수 없어 응답을 목록 형식으로 다시 요청해 주세요.`.trim());
   }
 
   if (hasEmbed) {
-    const embed = validateEmbedPayload(payload.embed);
+    const embed = validateEmbedPayload(payloadObject.embed);
     if (!embed) {
-      const rawFields = Array.isArray(payload.embed?.fields) ? payload.embed.fields : [];
+      const rawEmbed = payloadObject.embed && typeof payloadObject.embed === "object" && !Array.isArray(payloadObject.embed)
+        ? payloadObject.embed as StructuredObject
+        : {};
+      const rawFields = Array.isArray(rawEmbed.fields) ? rawEmbed.fields : [];
       const fallbackRows = rawFields
-        .filter((field) => field && typeof field.name === "string" && typeof field.value === "string")
+        .filter((field): field is StructuredObject => Boolean(field && typeof field === "object" && !Array.isArray(field)
+          && typeof (field as StructuredObject).name === "string" && typeof (field as StructuredObject).value === "string"))
         .map((field) => `**${field.name}**\n${field.value}`);
       return plainDiscordResponse([
         content,
-        payload.embed?.title,
-        payload.embed?.description,
+        typeof rawEmbed.title === "string" ? rawEmbed.title : undefined,
+        typeof rawEmbed.description === "string" ? rawEmbed.description : undefined,
         ...fallbackRows,
         "Embed 제한을 넘어 표를 목록 형태로 바꾸었습니다.",
       ].filter(Boolean).join("\n\n"));
@@ -527,13 +664,19 @@ function prepareDiscordResponse(answer) {
   }
 
   if (hasCsv) {
-    if (!payload.csv || typeof payload.csv !== "object" || Array.isArray(payload.csv)
-      || typeof payload.csv.content !== "string" || !payload.csv.content.trim()) {
+    const rawCsv = payloadObject.csv;
+    if (!rawCsv || typeof rawCsv !== "object" || Array.isArray(rawCsv)) {
       return plainDiscordResponse(`${content}\n\nCSV 첨부를 만들지 못했습니다.`.trim());
     }
+    const csvObject = rawCsv as StructuredObject;
+    const csvContentValue = csvObject.content;
+    if (typeof csvContentValue !== "string" || !csvContentValue.trim()) {
+      return plainDiscordResponse(`${content}\n\nCSV 첨부를 만들지 못했습니다.`.trim());
+    }
+    const csvContent = csvContentValue;
     const csv = {
-      filename: sanitizeCsvFilename(payload.csv.filename),
-      content: payload.csv.content.replaceAll(config.discordToken, "[Discord bot token redacted]"),
+      filename: sanitizeCsvFilename(typeof csvObject.filename === "string" ? csvObject.filename : undefined),
+      content: csvContent.replaceAll(config.discordToken, "[Discord bot token redacted]"),
     };
     if (Buffer.byteLength(csv.content, "utf8") > MAX_CSV_ATTACHMENT_BYTES) {
       return plainDiscordResponse(`${content}\n\nCSV 파일이 8 MiB 제한을 넘어 첨부하지 못했습니다.`.trim());
@@ -547,7 +690,7 @@ function prepareDiscordResponse(answer) {
   return plainDiscordResponse(content);
 }
 
-function toDiscordEmbed(embed) {
+function toDiscordEmbed(embed: EmbedData): EmbedBuilder {
   const builder = new EmbedBuilder();
   if (embed.title) builder.setTitle(embed.title);
   if (embed.description) builder.setDescription(embed.description);
@@ -555,7 +698,7 @@ function toDiscordEmbed(embed) {
   return builder;
 }
 
-function responseSendOptions(response, content, allowedMentions) {
+function responseSendOptions(response: PreparedDiscordResponse, content: string | undefined, allowedMentions: MessageMentionOptions): MessageCreateOptions {
   const options: MessageCreateOptions = { allowedMentions };
   if (!response.embed) options.flags = MessageFlags.SuppressEmbeds;
   if (content) options.content = content;
@@ -568,7 +711,7 @@ function responseSendOptions(response, content, allowedMentions) {
   return options;
 }
 
-async function postAnswer(sourceMessage, answer) {
+async function postAnswer(sourceMessage: Message, answer: string | PreparedDiscordResponse): Promise<string> {
   const response = prepareDiscordResponse(answer);
   const chunks = response.content
     ? splitForDiscord(response.content, config.maxDiscordMessageChars)
@@ -580,8 +723,10 @@ async function postAnswer(sourceMessage, answer) {
     { parse: [], repliedUser: false },
   ));
 
+  const sourceChannel = sourceMessage.channel;
+  if (!("send" in sourceChannel)) return response.historyText;
   for (const chunk of chunks.slice(1)) {
-    await sourceMessage.channel.send({
+    await sourceChannel.send({
       content: chunk,
       allowedMentions: { parse: [] },
       flags: MessageFlags.SuppressEmbeds,
@@ -591,7 +736,7 @@ async function postAnswer(sourceMessage, answer) {
   return response.historyText;
 }
 
-function enqueue(job) {
+function enqueue(job: CodexJob): Promise<void> {
   queuedJobCount += 1;
   const completion = queueTail.then(async () => {
     try {
@@ -599,7 +744,7 @@ function enqueue(job) {
       activeJob = job();
       return await activeJob;
     } finally {
-      activeJob = null;
+          activeJob = undefined;
       queuedJobCount -= 1;
     }
   });
@@ -607,11 +752,12 @@ function enqueue(job) {
   return completion;
 }
 
-function resolveStatusEmoji(message, name, fallback) {
-  return message.guild?.emojis.cache.find((emoji) => emoji.name?.toLowerCase() === name) || fallback;
+function resolveStatusEmoji(message: Message, name: string, fallback: string): string {
+  return message.guild?.emojis.cache.find((emoji) => emoji.name?.toLowerCase() === name)?.id || fallback;
 }
 
-function startTypingIndicator(channel) {
+function startTypingIndicator(channel: Message["channel"]): () => void {
+  if (!("sendTyping" in channel) || typeof channel.sendTyping !== "function") return () => {};
   let stopped = false;
   let sending = false;
   let failureLogged = false;
@@ -626,7 +772,7 @@ function startTypingIndicator(channel) {
         failureLogged = true;
         log("typing_indicator_failed", {
           channelId: channel.id,
-          diagnostic: describeCodexError(error),
+          diagnostic: describeCodexError(error instanceof Error ? error : String(error)),
         });
       }
     } finally {
@@ -644,7 +790,7 @@ function startTypingIndicator(channel) {
   };
 }
 
-function compactProgressText(value, maxChars) {
+function compactProgressText(value: string | undefined, maxChars: number): string {
   const text = String(value ?? "").replace(/\s+/g, " ").trim();
   const characters = Array.from(text);
   return characters.length > maxChars
@@ -652,7 +798,7 @@ function compactProgressText(value, maxChars) {
     : text;
 }
 
-function formatProgressPlan(items) {
+function formatProgressPlan(items: readonly ProgressPlanItem[]): ProgressPlanItem[] {
   if (!Array.isArray(items)) return [];
   return items
     .filter((item) => item && typeof item.text === "string" && item.text.trim())
@@ -663,7 +809,7 @@ function formatProgressPlan(items) {
     }));
 }
 
-function renderProgressMessage(question, plan, activity) {
+function renderProgressMessage(question: string, plan: readonly ProgressPlanItem[] | undefined, activity: string | undefined): string {
   const steps = plan ?? [];
   const activeIndex = steps.findIndex((step) => !step.completed);
   const lines = [
@@ -689,14 +835,14 @@ function renderProgressMessage(question, plan, activity) {
   return content.length > 1_900 ? `${content.slice(0, 1_870)}…(일부 생략)` : content;
 }
 
-async function createRequestProgress(sourceMessage, question) {
+async function createRequestProgress(sourceMessage: Message, question: string): Promise<RequestProgress | undefined> {
   const progressChannel = sourceMessage.channel;
   const initialContent = renderProgressMessage(
     question,
-    null,
+    undefined,
     "요청을 구체적인 조사 단계로 나누고 있습니다.",
   );
-  let progressMessage;
+  let progressMessage: Message | undefined;
   try {
     progressMessage = await sourceMessage.reply({
       content: initialContent,
@@ -707,16 +853,16 @@ async function createRequestProgress(sourceMessage, question) {
     log("request_progress_reply_failed", {
       messageId: sourceMessage.id,
       channelId: sourceMessage.channelId,
-      diagnostic: describeCodexError(error),
+      diagnostic: describeCodexError(error instanceof Error ? error : String(error)),
     });
-    return null;
+    return undefined;
   }
 
-  let plan = null;
-  let activity = null;
+  let plan: ProgressPlanItem[] | undefined;
+  let activity: string | undefined;
   let finished = false;
-  let finishPromise = null;
-  let renderTimer = null;
+  let finishPromise: Promise<void> | undefined;
+  let renderTimer: NodeJS.Timeout | undefined;
   let renderQueue = Promise.resolve();
   let lastRenderedContent = initialContent;
   const stopTyping = startTypingIndicator(progressChannel);
@@ -725,7 +871,7 @@ async function createRequestProgress(sourceMessage, question) {
     if (finished) return;
     if (renderTimer) clearTimeout(renderTimer);
     renderTimer = setTimeout(() => {
-      renderTimer = null;
+      renderTimer = undefined;
       renderQueue = renderQueue.then(async () => {
         const content = renderProgressMessage(question, plan, activity);
         if (content === lastRenderedContent) return;
@@ -736,14 +882,14 @@ async function createRequestProgress(sourceMessage, question) {
           log("request_progress_update_failed", {
             messageId: sourceMessage.id,
             channelId: progressChannel.id,
-            diagnostic: describeCodexError(error),
+            diagnostic: describeCodexError(error instanceof Error ? error : String(error)),
           });
         }
       }).catch((error) => {
         log("request_progress_update_failed", {
           messageId: sourceMessage.id,
           channelId: progressChannel.id,
-          diagnostic: describeCodexError(error),
+          diagnostic: describeCodexError(error instanceof Error ? error : String(error)),
         });
       });
     }, 500);
@@ -751,17 +897,17 @@ async function createRequestProgress(sourceMessage, question) {
   };
 
   return {
-    setPlan(items) {
+    setPlan(items: readonly ProgressPlanItem[]) {
       const nextPlan = formatProgressPlan(items);
       if (nextPlan.length === 0) return;
       plan = nextPlan;
-      activity = null;
+      activity = undefined;
       queueRender();
     },
-    setActivity(nextActivity) {
-      if (nextActivity === null) {
-        if (!plan || activity === null) return;
-        activity = null;
+    setActivity(nextActivity: string | undefined) {
+      if (nextActivity === undefined) {
+        if (!plan || activity === undefined) return;
+        activity = undefined;
       } else {
         if (typeof nextActivity !== "string" || !nextActivity.trim()) return;
         const normalizedActivity = nextActivity.trim();
@@ -774,7 +920,7 @@ async function createRequestProgress(sourceMessage, question) {
       if (finishPromise) return finishPromise;
       finished = true;
       if (renderTimer) clearTimeout(renderTimer);
-      renderTimer = null;
+      renderTimer = undefined;
       stopTyping();
       finishPromise = (async () => {
         await renderQueue;
@@ -785,7 +931,7 @@ async function createRequestProgress(sourceMessage, question) {
             messageId: sourceMessage.id,
             channelId: progressChannel.id,
             progressMessageId: progressMessage.id,
-            diagnostic: describeCodexError(error),
+            diagnostic: describeCodexError(error instanceof Error ? error : String(error)),
           });
         }
       })();
@@ -794,8 +940,8 @@ async function createRequestProgress(sourceMessage, question) {
   };
 }
 
-async function startMessageStatus(message) {
-  let loadingReaction = null;
+async function startMessageStatus(message: Message): Promise<() => Promise<void>> {
+  let loadingReaction: Awaited<ReturnType<Message["react"]>> | undefined;
 
   try {
     loadingReaction = await message.react(resolveStatusEmoji(message, "loading", "⏳"));
@@ -804,7 +950,7 @@ async function startMessageStatus(message) {
       stage: "loading",
       messageId: message.id,
       channelId: message.channelId,
-      diagnostic: describeCodexError(error),
+      diagnostic: describeCodexError(error instanceof Error ? error : String(error)),
     });
   }
 
@@ -821,7 +967,7 @@ async function startMessageStatus(message) {
           stage: "loading_remove",
           messageId: message.id,
           channelId: message.channelId,
-          diagnostic: describeCodexError(error),
+          diagnostic: describeCodexError(error instanceof Error ? error : String(error)),
         });
       }
     }
@@ -833,13 +979,13 @@ async function startMessageStatus(message) {
         stage: "complete",
         messageId: message.id,
         channelId: message.channelId,
-        diagnostic: describeCodexError(error),
+        diagnostic: describeCodexError(error instanceof Error ? error : String(error)),
       });
     }
   };
 }
 
-async function runCodexTurnWithProgress(thread, prompt, progress) {
+async function runCodexTurnWithProgress(thread: Thread, prompt: string, progress?: RequestProgress): Promise<{ finalResponse: string }> {
   const { events } = await thread.runStreamed(prompt);
   let finalResponse = "";
   let turnCompleted = false;
@@ -856,9 +1002,9 @@ async function runCodexTurnWithProgress(thread, prompt, progress) {
         const searchStatus = event.type === "item.completed" ? "검색 완료" : "검색 중";
         progress?.setActivity(query ? `${searchStatus}: ${query}` : `${searchStatus}: 웹 자료`);
       } else if (item.type === "command_execution") {
-        progress?.setActivity(null);
+        progress?.setActivity(undefined);
       } else if (item.type === "mcp_tool_call") {
-        progress?.setActivity(null);
+        progress?.setActivity(undefined);
       }
     } else if (event.type === "turn.completed") {
       turnCompleted = true;
@@ -867,8 +1013,6 @@ async function runCodexTurnWithProgress(thread, prompt, progress) {
       throw new Error(message || "Codex 작업이 실패했습니다.");
     } else if (event.type === "error") {
       throw new Error(event.message || "Codex 이벤트 스트림이 실패했습니다.");
-    } else if (event.type === "turn.interrupted") {
-      throw new Error("Codex 작업이 중단되었습니다.");
     }
   }
 
@@ -876,9 +1020,9 @@ async function runCodexTurnWithProgress(thread, prompt, progress) {
   return { finalResponse };
 }
 
-function isCodexLoggedIn() {
-  return new Promise((resolve) => {
-    let child;
+function isCodexLoggedIn(): Promise<boolean> {
+  return new Promise((resolve: (loggedIn: boolean) => void) => {
+    let child: ReturnType<typeof spawn>;
     try {
       child = spawn("codex", ["login", "status"], {
         env: createCodexCliEnvironment(config.codexHome),
@@ -890,7 +1034,7 @@ function isCodexLoggedIn() {
     }
 
     let settled = false;
-    const finish = (loggedIn) => {
+    const finish = (loggedIn: boolean) => {
       if (settled) return;
       settled = true;
       resolve(loggedIn);
@@ -900,7 +1044,7 @@ function isCodexLoggedIn() {
   });
 }
 
-function cleanCodexOutput(rawOutput) {
+function cleanCodexOutput(rawOutput: string): string {
   return rawOutput
     .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
     .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "")
@@ -914,7 +1058,7 @@ function cleanCodexOutput(rawOutput) {
     .slice(-1_500);
 }
 
-function formatLoginOutput(rawOutput) {
+function formatLoginOutput(rawOutput: string): string {
   const output = cleanCodexOutput(rawOutput);
 
   if (!output) {
@@ -923,7 +1067,7 @@ function formatLoginOutput(rawOutput) {
   return `Codex 기기 로그인 안내입니다. 외부 브라우저에서 주소를 열고 표시된 코드를 입력해 주세요.\n\n${output}`;
 }
 
-function formatLoginFailure(rawOutput, error) {
+function formatLoginFailure(rawOutput: string, error: Error & { exitCode?: number }): string {
   const output = cleanCodexOutput(rawOutput);
   const exitCode = Number.isInteger(error.exitCode) ? ` (종료 코드 ${error.exitCode})` : "";
 
@@ -934,9 +1078,9 @@ function formatLoginFailure(rawOutput, error) {
   return `Codex CLI가 인증을 완료하지 못했습니다${exitCode}. CLI 출력은 다음과 같습니다.\n\n${output}`;
 }
 
-function runCodexDeviceLogin(onOutput) {
-  return new Promise((resolve, reject) => {
-    let child;
+function runCodexDeviceLogin(onOutput: (chunk: string) => void): Promise<void> {
+  return new Promise((resolve: () => void, reject: (error: Error) => void) => {
+    let child: ReturnType<typeof spawn>;
     try {
       child = spawn("codex", ["login", "--device-auth"], {
         env: createCodexCliEnvironment(config.codexHome),
@@ -949,18 +1093,23 @@ function runCodexDeviceLogin(onOutput) {
 
     activeLoginChild = child;
     let settled = false;
-    const finish = (callback) => {
+    const finish = (callback: () => void) => {
       if (settled) return;
       settled = true;
-      if (activeLoginChild === child) activeLoginChild = null;
+      if (activeLoginChild === child) activeLoginChild = undefined;
       callback();
     };
 
+    if (!child.stdout || !child.stderr) {
+      child.kill("SIGTERM");
+      reject(new Error("Codex CLI output streams could not be opened."));
+      return;
+    }
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", onOutput);
     child.stderr.on("data", onOutput);
-    child.once("error", (error) => {
+    child.once("error", (error: NodeJS.ErrnoException) => {
       finish(() => reject(Object.assign(new Error("Codex CLI를 시작하지 못했습니다."), {
         kind: error.code === "ENOENT" ? "cli_missing" : "cli_start_failed",
       })));
@@ -971,14 +1120,14 @@ function runCodexDeviceLogin(onOutput) {
       } else {
         finish(() => reject(Object.assign(new Error("Codex 기기 로그인이 완료되지 않았습니다."), {
           kind: "login_not_completed",
-          exitCode: code,
+          ...(typeof code === "number" ? { exitCode: code } : {}),
         })));
       }
     });
   });
 }
 
-async function updateLoginInteraction(interaction, content) {
+async function updateLoginInteraction(interaction: ChatInputCommandInteraction, content: string): Promise<void> {
   try {
     await interaction.editReply({ content, allowedMentions: { parse: [] } });
   } catch {
@@ -986,7 +1135,7 @@ async function updateLoginInteraction(interaction, content) {
   }
 }
 
-async function handleLoginCommand(interaction) {
+async function handleLoginCommand(interaction: Interaction): Promise<void> {
   if (!interaction.isChatInputCommand() || interaction.commandName !== "login") return;
   if (interaction.guildId !== config.allowedGuildId) {
     await interaction.reply({
@@ -1012,22 +1161,22 @@ async function handleLoginCommand(interaction) {
   try {
     await enqueue(async () => {
       let rawOutput = "";
-      let outputTimer = null;
+      let outputTimer: NodeJS.Timeout | undefined;
       const publishOutput = () => {
-        outputTimer = null;
+        outputTimer = undefined;
         void updateLoginInteraction(interaction, formatLoginOutput(rawOutput));
       };
-      const collectOutput = (chunk) => {
+      const collectOutput = (chunk: string) => {
         rawOutput = `${rawOutput}${chunk}`.slice(-6_000);
-        if (outputTimer === null) outputTimer = setTimeout(publishOutput, 200);
+        if (!outputTimer) outputTimer = setTimeout(publishOutput, 200);
       };
 
       try {
         await updateLoginInteraction(interaction, "Codex 기기 인증을 시작합니다.");
         await runCodexDeviceLogin(collectOutput);
-        if (outputTimer !== null) {
+        if (outputTimer) {
           clearTimeout(outputTimer);
-          outputTimer = null;
+          outputTimer = undefined;
         }
         if (!(await isCodexLoggedIn())) {
           throw Object.assign(new Error("Codex 로그인 상태를 확인할 수 없습니다."), { kind: "login_status_failed" });
@@ -1035,7 +1184,7 @@ async function handleLoginCommand(interaction) {
         await updateLoginInteraction(interaction, "Codex 로그인이 완료됐습니다. 이 서버의 봇 계정으로 연결했으니 원래 요청을 다시 멘션해 주세요.");
         log("codex_login_completed");
       } catch (error) {
-        if (outputTimer !== null) clearTimeout(outputTimer);
+        if (outputTimer) clearTimeout(outputTimer);
         const loginError = (
           error instanceof Error ? error : new Error(String(error))
         ) as Error & { kind?: string; exitCode?: number };
@@ -1052,7 +1201,7 @@ async function handleLoginCommand(interaction) {
   }
 }
 
-function parseMcpAuthorizationOutput(rawOutput) {
+function parseMcpAuthorizationOutput(rawOutput: string): McpAuthorization | undefined {
   const output = rawOutput.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
   const candidates = output.match(/https:\/\/[^\s<>"'`]+/g) || [];
   for (const candidate of candidates) {
@@ -1071,13 +1220,17 @@ function parseMcpAuthorizationOutput(rawOutput) {
       // Ignore non-URL text and continue looking for the OAuth authorization link.
     }
   }
-  return null;
+  return undefined;
 }
 
-function startMcpOAuthProcess(serverName) {
-  let readyResolve;
-  let readyReject;
-  let doneResolve;
+function startMcpOAuthProcess(serverName: string): {
+  child: ChildProcessWithoutNullStreams;
+  ready: Promise<McpAuthorization>;
+  done: Promise<McpProcessResult>;
+} {
+  let readyResolve: (authorization: McpAuthorization) => void = () => {};
+  let readyReject: (error: Error) => void = () => {};
+  let doneResolve: (result: McpProcessResult) => void = () => {};
   let readySettled = false;
   let doneSettled = false;
   let rawOutput = "";
@@ -1085,7 +1238,7 @@ function startMcpOAuthProcess(serverName) {
     readyResolve = resolve;
     readyReject = reject;
   });
-  const done = new Promise<{ error?: Error; code?: number }>((resolve) => {
+  const done = new Promise<McpProcessResult>((resolve) => {
     doneResolve = resolve;
   });
   // A startup failure can occur before the command handler awaits `ready`.
@@ -1096,7 +1249,7 @@ function startMcpOAuthProcess(serverName) {
     stdio: ["pipe", "pipe", "pipe"],
   });
 
-  const handleOutput = (chunk) => {
+  const handleOutput = (chunk: string) => {
     rawOutput = `${rawOutput}${chunk}`.slice(-24_000);
     if (readySettled) return;
     const authorization = parseMcpAuthorizationOutput(rawOutput);
@@ -1109,7 +1262,7 @@ function startMcpOAuthProcess(serverName) {
   child.stderr.setEncoding("utf8");
   child.stdout.on("data", handleOutput);
   child.stderr.on("data", handleOutput);
-  child.once("error", (error) => {
+  child.once("error", (error: Error) => {
     if (!readySettled) {
       readySettled = true;
       readyReject(error);
@@ -1128,14 +1281,14 @@ function startMcpOAuthProcess(serverName) {
     }
     if (!doneSettled) {
       doneSettled = true;
-      doneResolve({ code });
+      doneResolve({ code: typeof code === "number" ? code : -1 });
     }
   });
 
   return { child, ready, done };
 }
 
-function validateMcpCallbackUrl(session, rawCallbackUrl) {
+function validateMcpCallbackUrl(session: McpLoginSession, rawCallbackUrl: string): string | undefined {
   const value = rawCallbackUrl.trim();
   if (!value || value.length > 4_000 || /[\r\n]/.test(value)) {
     return "브라우저 주소창의 콜백 URL 전체를 한 줄로 붙여넣어 주세요.";
@@ -1148,7 +1301,9 @@ function validateMcpCallbackUrl(session, rawCallbackUrl) {
     return "URL 형식이 올바르지 않습니다. 브라우저 주소창의 전체 주소를 복사해 주세요.";
   }
 
-  const expected = session.authorization.redirect;
+  const authorization = session.authorization;
+  if (!authorization) return "로그인 인증 정보가 준비되지 않았습니다. 다시 시작해 주세요.";
+  const expected = authorization.redirect;
   const sameRedirect = callback.protocol === expected.protocol
     && callback.hostname === expected.hostname
     && callback.pathname === expected.pathname
@@ -1159,7 +1314,7 @@ function validateMcpCallbackUrl(session, rawCallbackUrl) {
     return "이 주소는 현재 로그인 요청의 콜백 주소가 아닙니다. 방금 승인한 브라우저 탭의 주소를 복사해 주세요.";
   }
 
-  if (callback.searchParams.get("state") !== session.authorization.state) {
+  if (callback.searchParams.get("state") !== authorization.state) {
     return "이 URL은 현재 로그인 요청에 대한 응답이 아닙니다. 방금 승인한 브라우저 탭의 주소를 복사해 주세요.";
   }
   if (callback.searchParams.has("error")) {
@@ -1169,31 +1324,37 @@ function validateMcpCallbackUrl(session, rawCallbackUrl) {
   if (!callback.searchParams.get("code")) {
     return "승인 코드가 URL에 없습니다. 승인을 마친 뒤 브라우저 주소창의 전체 URL을 복사해 주세요.";
   }
-  return null;
+  return undefined;
 }
 
-function getMcpDisplayName(serverName) {
+function getMcpDisplayName(serverName: string): string {
   if (serverName === "notion") return "Notion";
   if (serverName === "jira") return "Jira";
   return serverName;
 }
 
-function buildMcpLoginMessage(session) {
+function buildMcpLoginMessage(session: McpLoginSession): {
+  content: string;
+  components: ActionRowBuilder<ButtonBuilder>[];
+  allowedMentions: { parse: [] };
+} {
   const displayName = getMcpDisplayName(session.serverName);
+  const authorization = session.authorization;
+  if (!authorization) throw new Error("MCP authorization was not initialized.");
   const content = [
     `**${displayName} MCP 로그인**`,
     `${displayName} 접근을 승인하려면 로그인 버튼을 눌러 주세요.`,
     "승인 후 브라우저에서 localhost 접속 오류가 보이면 정상입니다. 주소창의 전체 URL을 복사해 ‘승인 URL 붙여넣기’를 누르세요.",
     "콜백 URL에는 일회용 인증 코드가 포함됩니다. 이 비공개 응답의 입력창에만 붙여넣어 주세요. 로그인 요청은 10분 뒤 만료됩니다.",
   ].join("\n\n");
-  const components = [];
-  const buttons = [];
+  const components: ActionRowBuilder<ButtonBuilder>[] = [];
+  const buttons: ButtonBuilder[] = [];
 
-  if (session.authorization.authorizationUrl.length <= 512) {
+  if (authorization.authorizationUrl.length <= 512) {
     buttons.push(new ButtonBuilder()
       .setLabel(`${displayName} 로그인`)
       .setStyle(ButtonStyle.Link)
-      .setURL(session.authorization.authorizationUrl));
+      .setURL(authorization.authorizationUrl));
   }
   buttons.push(new ButtonBuilder()
     .setCustomId(`mcp_login_callback:${session.id}`)
@@ -1203,15 +1364,19 @@ function buildMcpLoginMessage(session) {
     .setCustomId(`mcp_login_cancel:${session.id}`)
     .setLabel("취소")
     .setStyle(ButtonStyle.Secondary));
-  components.push(new ActionRowBuilder().addComponents(buttons));
+  components.push(new ActionRowBuilder<ButtonBuilder>().addComponents(buttons));
 
-  const finalContent = session.authorization.authorizationUrl.length <= 512
+  const finalContent = authorization.authorizationUrl.length <= 512
     ? content
-    : `${content}\n\n[${displayName} 로그인 열기](<${session.authorization.authorizationUrl}>)`;
+    : `${content}\n\n[${displayName} 로그인 열기](<${authorization.authorizationUrl}>)`;
   return { content: finalContent, components, allowedMentions: { parse: [] } };
 }
 
-async function editMcpLoginReply(interaction, content, components = []) {
+async function editMcpLoginReply(
+  interaction: ChatInputCommandInteraction | ModalSubmitInteraction,
+  content: string,
+  components: ActionRowBuilder<ButtonBuilder>[] = [],
+): Promise<void> {
   if (!interaction) return;
   try {
     await interaction.editReply({
@@ -1224,12 +1389,16 @@ async function editMcpLoginReply(interaction, content, components = []) {
   }
 }
 
-async function finishMcpLoginSession(session, outcome, terminateChild = false) {
+async function finishMcpLoginSession(
+  session: McpLoginSession,
+  outcome: McpLoginOutcome,
+  terminateChild = false,
+): Promise<void> {
   if (session.finalized) return;
   session.finalized = true;
   if (session.timeout) clearTimeout(session.timeout);
-  if (activeMcpLogin === session) activeMcpLogin = null;
-  if (terminateChild && session.child && session.child.exitCode === null) {
+  if (activeMcpLogin === session) activeMcpLogin = undefined;
+  if (terminateChild && session.child) {
     session.child.kill("SIGTERM");
   }
 
@@ -1245,11 +1414,14 @@ async function finishMcpLoginSession(session, outcome, terminateChild = false) {
     content = `${displayName} MCP 로그인 요청이 만료됐습니다. 다시 실행해 주세요: /mcp-login ${session.serverName}`;
     log("mcp_login_expired", { mcpName: session.serverName });
   } else {
+    const failedOutcome = outcome as Extract<McpLoginOutcome, { kind: "failed" }>;
     content = `${displayName} MCP 로그인을 완료하지 못했습니다. 다시 실행해 주세요: /mcp-login ${session.serverName}`;
     log("mcp_login_failed", {
       mcpName: session.serverName,
-      ...(Number.isInteger(outcome.code) ? { exitCode: outcome.code } : {}),
-      ...(outcome.error?.code ? { errorCode: outcome.error.code } : {}),
+      ...(Number.isInteger(failedOutcome.code) ? { exitCode: failedOutcome.code } : {}),
+      ...((failedOutcome.error as NodeJS.ErrnoException | undefined)?.code
+        ? { errorCode: (failedOutcome.error as NodeJS.ErrnoException).code }
+        : {}),
     });
   }
 
@@ -1259,7 +1431,7 @@ async function finishMcpLoginSession(session, outcome, terminateChild = false) {
   }
 }
 
-async function handleMcpLoginCommand(interaction) {
+async function handleMcpLoginCommand(interaction: Interaction): Promise<void> {
   if (!interaction.isChatInputCommand() || interaction.commandName !== "mcp-login") return;
   if (interaction.guildId !== config.allowedGuildId) {
     await interaction.reply({
@@ -1288,18 +1460,13 @@ async function handleMcpLoginCommand(interaction) {
     return;
   }
 
-  const session = {
+  const session: McpLoginSession = {
     id: randomUUID(),
     serverName,
     ownerUserId: interaction.user.id,
     commandInteraction: interaction,
-    callbackInteraction: null,
-    authorization: null,
-    child: null,
-    timeout: null,
     finalized: false,
     phase: "starting",
-    closedResult: null,
   };
   activeMcpLogin = session;
 
@@ -1325,9 +1492,10 @@ async function handleMcpLoginCommand(interaction) {
       clearTimeout(startupTimer);
     }
     session.authorization = authorization;
-    if (session.closedResult) {
-      await finishMcpLoginSession(session, session.closedResult.error || session.closedResult.code !== 0
-        ? { kind: "failed", ...session.closedResult }
+    const completedBeforeReply = session.closedResult as McpProcessResult | undefined;
+    if (completedBeforeReply) {
+      await finishMcpLoginSession(session, completedBeforeReply.error || completedBeforeReply.code !== 0
+        ? { kind: "failed", ...completedBeforeReply }
         : { kind: "success" });
       return;
     }
@@ -1344,11 +1512,14 @@ async function handleMcpLoginCommand(interaction) {
         : { kind: "success" });
     }
   } catch (error) {
-    await finishMcpLoginSession(session, { kind: "failed", error });
+    await finishMcpLoginSession(session, {
+      kind: "failed",
+      error: error instanceof Error ? error : new Error(String(error)),
+    });
   }
 }
 
-async function handleMcpLoginButton(interaction) {
+async function handleMcpLoginButton(interaction: Interaction): Promise<boolean> {
   if (!interaction.isButton()) return false;
   const match = interaction.customId.match(/^mcp_login_(callback|cancel):([0-9a-f-]{36})$/i);
   if (!match) return false;
@@ -1384,7 +1555,7 @@ async function handleMcpLoginButton(interaction) {
   return true;
 }
 
-async function handleMcpLoginCallback(interaction) {
+async function handleMcpLoginCallback(interaction: Interaction): Promise<boolean> {
   if (!interaction.isModalSubmit()) return false;
   const match = interaction.customId.match(/^mcp_login_callback:([0-9a-f-]{36})$/i);
   if (!match) return false;
@@ -1415,31 +1586,42 @@ async function handleMcpLoginCallback(interaction) {
   try {
     session.child.stdin.write(`${callbackUrl.trim()}\n`);
   } catch (error) {
-    await finishMcpLoginSession(session, { kind: "failed", error }, true);
+    await finishMcpLoginSession(session, {
+      kind: "failed",
+      error: error instanceof Error ? error : new Error(String(error)),
+    }, true);
     return true;
   }
   await editMcpLoginReply(interaction, "승인 결과를 확인하고 있습니다. 완료될 때까지 잠시 기다려 주세요.");
   return true;
 }
 
-function isQuotaRecheckRequest(question) {
+function isQuotaRecheckRequest(question: string): boolean {
   return /^(재확인|다시\s*확인|quota\s*check|status)$/i.test(question.trim());
 }
 
-async function saveReply(conversationKey, sourceMessage, answer) {
+async function saveReply(
+  conversationKey: string,
+  sourceMessage: Message,
+  answer: string | PreparedDiscordResponse,
+): Promise<string> {
   const savedAnswer = await postAnswer(sourceMessage, answer);
   database.addAssistantMessage(conversationKey, savedAnswer);
   return savedAnswer;
 }
 
-function boundAnswer(answer) {
+function boundAnswer(answer: string): string {
   const suffix = "\n\n(응답이 Discord 전송 한도 때문에 일부 잘렸습니다.)";
   const safeAnswer = answer.replaceAll(config.discordToken, "[Discord bot token redacted]");
   if (safeAnswer.length <= config.maxResponseChars) return safeAnswer;
   return `${safeAnswer.slice(0, config.maxResponseChars - suffix.length)}${suffix}`;
 }
 
-async function processQuotaRecheck(conversationKey, sourceMessage, requesterUserId = sourceMessage.author.id) {
+async function processQuotaRecheck(
+  conversationKey: string,
+  sourceMessage: Message,
+  requesterUserId = sourceMessage.author.id,
+): Promise<void> {
   const codex = createCodexForMessage(sourceMessage, {
     allowScheduleWrites: false,
     requesterUserId,
@@ -1462,11 +1644,11 @@ async function processRequest({
   quotaRecheck = isQuotaRecheckRequest(question),
   conversationKey,
   guildId,
-  progress = null,
+  progress,
   requesterUserId = sourceMessage.author.id,
   initialHistory = [],
-}) {
-  const reply = async (answer) => {
+}: ProcessRequestOptions): Promise<void> {
+  const reply = async (answer: string | PreparedDiscordResponse): Promise<void> => {
     await progress?.finish();
     await saveReply(conversationKey, sourceMessage, answer);
   };
@@ -1480,7 +1662,7 @@ async function processRequest({
     try {
       await processQuotaRecheck(conversationKey, sourceMessage, requesterUserId);
     } catch (error) {
-      const errorKind = classifyCodexError(error);
+      const errorKind = classifyCodexError(error instanceof Error ? error : String(error));
       if (errorKind === "not_authenticated") {
         await reply(LOGIN_REQUIRED_MESSAGE);
         log("codex_login_required", { channelId: sourceMessage.channelId });
@@ -1491,7 +1673,7 @@ async function processRequest({
         log("quota_recheck_failed", {
           category: errorKind,
           messageId: sourceMessage.id,
-          diagnostic: describeCodexError(error),
+          diagnostic: describeCodexError(error instanceof Error ? error : String(error)),
         });
       }
     }
@@ -1504,14 +1686,14 @@ async function processRequest({
     return;
   }
 
-  let thread = null;
-  let codex = null;
+  let thread: Thread | undefined;
+  let codex: ReturnType<typeof createCodexForMessage> | undefined;
   let currentPrompt = "";
   let failureStage = "conversation_load";
   const requestTime = new Date();
   const notificationTargets = getScheduleNotificationTargets(sourceMessage);
-  const discordContext = {
-    guildId: sourceMessage.guildId,
+  const discordContext: DiscordContext = {
+    guildId,
     channelId: sourceMessage.channelId,
     isThread: sourceMessage.channel?.isThread?.() ?? false,
     requesterUserId,
@@ -1528,6 +1710,7 @@ async function processRequest({
   try {
     codex = createCodexForMessage(sourceMessage, { requesterUserId, notificationTargets });
     const conversation = database.getConversation(conversationKey);
+    if (!conversation) throw new Error("The Discord conversation could not be loaded.");
     failureStage = "memory_lookup";
     const memory = database.findRelevantMemory(guildId, question, MEMORY_LIMIT);
     failureStage = conversation.codex_thread_id ? "thread_resume" : "thread_start";
@@ -1550,13 +1733,15 @@ async function processRequest({
     const answer = prepareDiscordResponse(turn.finalResponse?.trim() || "요청을 처리했지만 답변 텍스트가 비어 있습니다.");
 
     failureStage = "database_save";
-    database.setCodexThreadId(conversationKey, thread.id);
+    const threadId = thread.id;
+    if (!threadId) throw new Error("Codex did not return a thread identifier.");
+    database.setCodexThreadId(conversationKey, threadId);
     database.saveResearchMemory({ guildId, conversationKey, question, answer: answer.historyText });
     failureStage = "discord_reply";
     await reply(answer);
     log("request_completed", { channelId: sourceMessage.channelId });
   } catch (error) {
-    const errorKind = classifyCodexError(error);
+    const errorKind = classifyCodexError(error instanceof Error ? error : String(error));
     if (errorKind === "not_authenticated") {
       await reply(LOGIN_REQUIRED_MESSAGE);
       log("codex_login_required", { channelId: sourceMessage.channelId });
@@ -1569,12 +1754,14 @@ async function processRequest({
       return;
     }
 
-    let failureError = error;
+    let failureError: Error | string = error instanceof Error ? error : String(error);
     let failureKind = errorKind;
-    if (errorKind === "thread_missing" && thread) {
+    if (errorKind === "thread_missing" && thread && codex) {
       failureStage = "thread_restore_retry";
       try {
         const replacementThread = codex.startThread(codexThreadOptions);
+        const replacementThreadId = replacementThread.id;
+        if (!replacementThreadId) throw new Error("Codex did not return a thread identifier.");
         currentPrompt = buildCodexPrompt({
           question,
           history: [...initialHistory, ...database.getRecentHistory(conversationKey, sourceMessage.id, THREAD_HISTORY_LIMIT)]
@@ -1585,13 +1772,13 @@ async function processRequest({
         progress?.setActivity("이전 Codex 대화를 복구하지 못해 현재 요청을 새 문맥에서 다시 조사하고 있습니다.");
         const turn = await runCodexTurnWithProgress(replacementThread, currentPrompt, progress);
         const answer = prepareDiscordResponse(turn.finalResponse?.trim() || "요청을 처리했지만 답변 텍스트가 비어 있습니다.");
-        database.setCodexThreadId(conversationKey, replacementThread.id);
+        database.setCodexThreadId(conversationKey, replacementThreadId);
         database.saveResearchMemory({ guildId, conversationKey, question, answer: answer.historyText });
         await reply(answer);
         log("request_completed_after_thread_restore", { channelId: sourceMessage.channelId });
         return;
       } catch (retryError) {
-        const retryErrorKind = classifyCodexError(retryError);
+        const retryErrorKind = classifyCodexError(retryError instanceof Error ? retryError : String(retryError));
         if (retryErrorKind === "not_authenticated") {
           await reply(LOGIN_REQUIRED_MESSAGE);
           log("codex_login_required", { channelId: sourceMessage.channelId });
@@ -1603,7 +1790,7 @@ async function processRequest({
           log("usage_limit_reached");
           return;
         }
-        failureError = retryError;
+        failureError = retryError instanceof Error ? retryError : String(retryError);
         failureKind = retryErrorKind;
       }
     }
@@ -1621,12 +1808,12 @@ async function processRequest({
   }
 }
 
-function nextCronRun(cronExpression, timezone, currentDate) {
+function nextCronRun(cronExpression: string, timezone: string, currentDate: Date): string {
   const iterator = CronExpressionParser.parse(cronExpression, { currentDate, tz: timezone });
   return iterator.next().toDate().toISOString();
 }
 
-function formatScheduleTime(isoDate, timezone) {
+function formatScheduleTime(isoDate: string, timezone: string): string {
   return new Intl.DateTimeFormat("ko-KR", {
     timeZone: timezone,
     dateStyle: "full",
@@ -1634,9 +1821,12 @@ function formatScheduleTime(isoDate, timezone) {
   }).format(new Date(isoDate));
 }
 
-async function sendScheduleNotification(schedule, content) {
-  let channel = client.channels.cache.get(schedule.channel_id);
-  if (!channel) channel = await client.channels.fetch(schedule.channel_id);
+async function sendScheduleNotification(
+  schedule: ScheduleRow | OccurrenceRow,
+  content: string | PreparedDiscordResponse,
+): Promise<string> {
+  const channel = client.channels.cache.get(schedule.channel_id)
+    ?? await client.channels.fetch(schedule.channel_id);
   if (!channel?.isTextBased?.() || !("send" in channel) || typeof channel.send !== "function") {
     throw new Error("The schedule's Discord channel is no longer available for messages.");
   }
@@ -1664,10 +1854,12 @@ async function sendScheduleNotification(schedule, content) {
   return response.historyText;
 }
 
-async function executeScheduleOccurrence(occurrence) {
+async function executeScheduleOccurrence(occurrence: OccurrenceRow): Promise<void> {
   try {
     if (occurrence.run_type === "event_reminder") {
-      if (Date.parse(occurrence.event_at) <= Date.now()) {
+      const eventAt = occurrence.event_at;
+      if (!eventAt) throw new Error("Event reminder is missing its event time.");
+      if (Date.parse(eventAt) <= Date.now()) {
         database.finishScheduleOccurrence({
           id: occurrence.id,
           status: "succeeded",
@@ -1675,10 +1867,10 @@ async function executeScheduleOccurrence(occurrence) {
         });
         return;
       }
-      const reminderMinutes = Math.round((Date.parse(occurrence.event_at) - Date.parse(occurrence.scheduled_at)) / 60_000);
+      const reminderMinutes = Math.round((Date.parse(eventAt) - Date.parse(occurrence.scheduled_at)) / 60_000);
       await sendScheduleNotification(occurrence, [
         `일정 알림: **${occurrence.title}** 시작 ${reminderMinutes}분 전입니다.`,
-        `시작 시각: ${formatScheduleTime(occurrence.event_at, occurrence.timezone)} (${occurrence.timezone})`,
+        `시작 시각: ${formatScheduleTime(eventAt, occurrence.timezone)} (${occurrence.timezone})`,
         ...(occurrence.details ? [`메모: ${occurrence.details}`] : []),
       ].join("\n"));
       database.finishScheduleOccurrence({
@@ -1729,7 +1921,7 @@ async function executeScheduleOccurrence(occurrence) {
     database.finishScheduleOccurrence({ id: occurrence.id, status: "succeeded", result: answer.historyText });
     log("schedule_task_completed", { scheduleId: occurrence.schedule_id, channelId: occurrence.channel_id });
   } catch (error) {
-    const errorKind = classifyCodexError(error);
+    const errorKind = classifyCodexError(error instanceof Error ? error : String(error));
     let message = USER_ERROR_TEXT;
     if (errorKind === "usage_limited") {
       database.setUsageLimited(true);
@@ -1744,19 +1936,19 @@ async function executeScheduleOccurrence(occurrence) {
       log("schedule_notification_failed", {
         scheduleId: occurrence.schedule_id,
         channelId: occurrence.channel_id,
-        diagnostic: describeCodexError(deliveryError),
+        diagnostic: describeCodexError(deliveryError instanceof Error ? deliveryError : String(deliveryError)),
       });
     }
     database.finishScheduleOccurrence({
       id: occurrence.id,
       status: "failed",
-      error: describeCodexError(error, { redactValues: [config.discordToken] }),
+      error: describeCodexError(error instanceof Error ? error : String(error), { redactValues: [config.discordToken] }),
     });
     log("schedule_execution_failed", {
       category: errorKind,
       scheduleId: occurrence.schedule_id,
       channelId: occurrence.channel_id,
-      diagnostic: describeCodexError(error, { redactValues: [config.discordToken] }),
+      diagnostic: describeCodexError(error instanceof Error ? error : String(error), { redactValues: [config.discordToken] }),
     });
   }
 }
@@ -1769,28 +1961,37 @@ function pollSchedules() {
     const nowIso = currentTime.toISOString();
     for (const schedule of database.getDueCronSchedules(nowIso)) {
       try {
+        const scheduledAt = schedule.next_run_at;
+        const cronExpression = schedule.cron_expression;
+        if (!scheduledAt || !cronExpression) throw new Error("Cron schedule is missing its next run time or expression.");
         database.advanceCronSchedule({
           scheduleId: schedule.id,
-          scheduledAt: schedule.next_run_at,
-          nextRunAt: nextCronRun(schedule.cron_expression, schedule.timezone, currentTime),
+          scheduledAt,
+          nextRunAt: nextCronRun(cronExpression, schedule.timezone, currentTime),
         });
       } catch (error) {
         log("schedule_cron_invalid", {
           scheduleId: schedule.id,
-          diagnostic: describeCodexError(error),
+          diagnostic: describeCodexError(error instanceof Error ? error : String(error)),
         });
       }
     }
 
     const eventReminderHorizon = new Date(currentTime.getTime() + 15 * 60_000).toISOString();
     for (const schedule of database.getUpcomingEvents(nowIso, eventReminderHorizon, 200)) {
-      let reminderOffsets;
+      const eventAtValue = schedule.event_at;
+      if (!eventAtValue) continue;
+      let reminderOffsets: number[];
       try {
-        reminderOffsets = JSON.parse(schedule.reminder_offsets);
+        const parsedOffsets = JSON.parse(schedule.reminder_offsets) as number[];
+        if (!Array.isArray(parsedOffsets) || !parsedOffsets.every((value) => Number.isFinite(value))) {
+          throw new Error("Invalid reminder offsets");
+        }
+        reminderOffsets = parsedOffsets;
       } catch {
         reminderOffsets = [15, 5];
       }
-      const eventAt = Date.parse(schedule.event_at);
+      const eventAt = Date.parse(eventAtValue);
       for (const offsetMinutes of reminderOffsets) {
         const reminderAt = eventAt - offsetMinutes * 60_000;
         const nextReminderOffset = reminderOffsets.filter((offset) => offset < offsetMinutes).sort((a, b) => b - a)[0];
@@ -1807,23 +2008,28 @@ function pollSchedules() {
       void enqueue(() => executeScheduleOccurrence(occurrence)).catch((error) => {
         log("schedule_queue_failed", {
           scheduleId: occurrence.schedule_id,
-          diagnostic: describeCodexError(error, { redactValues: [config.discordToken] }),
+      diagnostic: describeCodexError(error instanceof Error ? error : String(error), { redactValues: [config.discordToken] }),
         });
       });
     }
   } catch (error) {
-    log("schedule_poll_failed", { diagnostic: describeCodexError(error) });
+    log("schedule_poll_failed", { diagnostic: describeCodexError(error instanceof Error ? error : String(error)) });
   } finally {
     schedulePollRunning = false;
   }
 }
 
-async function loadQnaChannelContext(channel, beforeTimestamp) {
+async function loadQnaChannelContext(
+  channel: GuildTextBasedChannel,
+  beforeTimestamp: number,
+): Promise<{ history: PromptHistoryEntry[] }> {
+  const botUser = client.user;
+  if (!botUser) return { history: [] };
   const fetched = await channel.messages.fetch({ limit: QNA_CONTEXT_FETCH_LIMIT });
   const recentMessages = [...fetched.values()]
     .filter((message) => message.createdTimestamp <= beforeTimestamp)
     .filter((message) => message.content.trim() || message.reference || collectionValues(message.messageSnapshots).length > 0)
-    .filter((message) => !message.author.bot || message.author.id === client.user?.id)
+    .filter((message) => !message.author.bot || message.author.id === botUser.id)
     .filter((message) => !message.content.startsWith("🔎 **분석 진행 상황**"))
     .sort((first, second) => first.createdTimestamp - second.createdTimestamp);
 
@@ -1833,12 +2039,12 @@ async function loadQnaChannelContext(channel, beforeTimestamp) {
       || message.author.username;
     const content = message.author.bot
       ? message.content
-      : cleanRequestContent(message.content, client.user.id);
+      : cleanRequestContent(message.content, botUser.id);
     const linkedMessageContext = message.author.bot ? "" : await getLinkedMessageContext(message);
     const historyContent = [content, linkedMessageContext].filter(Boolean).join("\n\n")
       || "연결된 원문 메시지";
     return {
-      role: message.author.bot ? "assistant" : "user",
+      role: message.author.bot ? "assistant" as const : "user" as const,
       content: `${displayName}: ${compactProgressText(historyContent, 1_400)}`,
     };
   }));
@@ -1853,9 +2059,9 @@ async function processInitialQnaRequest({
   guildId,
   requesterUserId,
   initialHistory,
-}) {
-  let progress = null;
-  let stopFallbackTyping = null;
+}: InitialQnaRequestOptions): Promise<void> {
+  let progress: RequestProgress | undefined;
+  let stopFallbackTyping: (() => void) | undefined;
   try {
     if (activeMcpLogin) {
       await saveReply(conversationKey, sourceMessage, MCP_LOGIN_IN_PROGRESS_MESSAGE);
@@ -1897,7 +2103,7 @@ async function processInitialQnaRequest({
   }
 }
 
-async function handleQnaCommand(interaction) {
+async function handleQnaCommand(interaction: Interaction): Promise<void> {
   if (!interaction.isChatInputCommand() || interaction.commandName !== "qna") return;
   if (interaction.guildId !== config.allowedGuildId) {
     await interaction.reply({
@@ -1906,6 +2112,7 @@ async function handleQnaCommand(interaction) {
     });
     return;
   }
+  const guildId = interaction.guildId;
 
   if (activeMcpLogin) {
     await interaction.reply({
@@ -1934,43 +2141,50 @@ async function handleQnaCommand(interaction) {
 
   // A slash command is an interaction, not a user-authored channel message.
   // Use its public response as the stable thread anchor instead of an earlier chat message.
+  const qnaChannel = interaction.channel;
+  if (!qnaChannel || !("messages" in qnaChannel)) {
+    await interaction.reply({ content: "이 채널에서는 Q&A를 시작할 수 없습니다.", flags: MessageFlags.Ephemeral });
+    return;
+  }
   await interaction.deferReply();
 
-  let thread = null;
+  let thread: AnyThreadChannel | undefined;
   try {
     const { history } = await loadQnaChannelContext(
-      interaction.channel,
+      qnaChannel as GuildTextBasedChannel,
       interaction.createdTimestamp,
     );
-    const displayName = interaction.member?.displayName
+    const displayName = interaction.member && "displayName" in interaction.member
+      ? interaction.member.displayName
       || interaction.user.globalName
-      || interaction.user.username;
+      || interaction.user.username
+      : interaction.user.globalName || interaction.user.username;
     const threadName = `Q&A · ${compactProgressText(question, 88)}`;
     const threadAnchor = await interaction.editReply({
       content: `**${displayName}의 Q&A 요청**\n${question}`,
       allowedMentions: { parse: [] },
     });
-    thread = await threadAnchor.startThread({
+    const qnaThread = await threadAnchor.startThread({
       name: threadName,
       reason: `Q&A requested by ${interaction.user.id}`,
     });
-    const sourceMessage = await thread.send({
+    thread = qnaThread;
+    const sourceMessage = await qnaThread.send({
       content: `**${displayName}의 질문:**\n${question}`,
       allowedMentions: { parse: [] },
     });
-    const conversationKey = `${interaction.guildId}:${thread.id}:shared`;
+    const conversationKey = `${guildId}:${qnaThread.id}:shared`;
 
     database.registerQnaThread({
-      threadId: thread.id,
-      guildId: interaction.guildId,
+      threadId: qnaThread.id,
+      guildId,
       parentChannelId: interaction.channelId,
       ownerUserId: interaction.user.id,
     });
     database.ensureConversation({
       conversationKey,
-      guildId: interaction.guildId,
-      channelId: thread.id,
-      ownerUserId: null,
+      guildId,
+      channelId: qnaThread.id,
     });
     for (const contextMessage of history) {
       database.addContextMessage(conversationKey, contextMessage);
@@ -1986,34 +2200,34 @@ async function handleQnaCommand(interaction) {
       sourceMessage,
       question,
       conversationKey,
-      guildId: interaction.guildId,
+      guildId,
       requesterUserId: interaction.user.id,
       initialHistory: [],
     }));
     void completion.catch((error) => {
       log("qna_request_failed", {
-        threadId: thread.id,
+        threadId: qnaThread.id,
         channelId: interaction.channelId,
-        diagnostic: describeCodexError(error),
+        diagnostic: describeCodexError(error instanceof Error ? error : String(error)),
       });
     });
 
     log("qna_thread_created", {
-      guildId: interaction.guildId,
+      guildId,
       parentChannelId: interaction.channelId,
-      threadId: thread.id,
+      threadId: qnaThread.id,
       requesterUserId: interaction.user.id,
       contextMessageCount: history.length,
     });
     try {
       await interaction.editReply({
-        content: `**${displayName}의 Q&A 요청**\n${question}\n\n스레드: <#${thread.id}>`,
+        content: `**${displayName}의 Q&A 요청**\n${question}\n\n스레드: <#${qnaThread.id}>`,
         allowedMentions: { parse: [] },
       });
     } catch (error) {
       log("qna_interaction_ack_failed", {
-        threadId: thread.id,
-        diagnostic: describeCodexError(error),
+        threadId: qnaThread.id,
+        diagnostic: describeCodexError(error instanceof Error ? error : String(error)),
       });
     }
   } catch (error) {
@@ -2025,19 +2239,20 @@ async function handleQnaCommand(interaction) {
       }
     }
     log("qna_thread_creation_failed", {
-      guildId: interaction.guildId,
+      guildId,
       channelId: interaction.channelId,
-      diagnostic: describeCodexError(error),
+      diagnostic: describeCodexError(error instanceof Error ? error : String(error)),
     });
     await interaction.editReply("Q&A 스레드를 준비하지 못했습니다. 봇의 채널 기록 및 스레드 권한을 확인한 뒤 다시 시도해 주세요.");
   }
 }
 
-async function handleMessage(message) {
-  if (!message.guildId || message.guildId !== config.allowedGuildId) return;
+async function handleMessage(message: Message): Promise<void> {
+  const guildId = message.guildId;
+  if (!guildId || guildId !== config.allowedGuildId) return;
   if (message.author.bot || !client.user) return;
   const isQnaThread = message.channel.isThread?.()
-    && database.isQnaThread(message.channelId, message.guildId);
+    && database.isQnaThread(message.channelId, guildId);
   if (!isQnaThread && !message.mentions.users.has(client.user.id)) return;
 
   const userQuestion = cleanRequestContent(message.content, client.user.id);
@@ -2046,9 +2261,9 @@ async function handleMessage(message) {
   const conversationKey = createConversationKey(message);
   database.ensureConversation({
     conversationKey,
-    guildId: message.guildId,
+    guildId,
     channelId: message.channelId,
-    ownerUserId: message.channel.isThread?.() ? null : message.author.id,
+    ownerUserId: message.channel.isThread?.() ? undefined : message.author.id,
   });
 
   if (!question) {
@@ -2068,8 +2283,8 @@ async function handleMessage(message) {
   if (!inserted) return;
 
   const finishStatus = await startMessageStatus(message);
-  let progress = null;
-  let stopFallbackTyping = null;
+  let progress: RequestProgress | undefined;
+  let stopFallbackTyping: (() => void) | undefined;
   try {
     if (activeMcpLogin) {
       await saveReply(conversationKey, message, MCP_LOGIN_IN_PROGRESS_MESSAGE);
@@ -2101,7 +2316,7 @@ async function handleMessage(message) {
       question,
       quotaRecheck: isQuotaRecheckRequest(userQuestion),
       conversationKey,
-      guildId: message.guildId,
+      guildId,
       progress,
     }));
     await completion;
@@ -2137,21 +2352,24 @@ async function main() {
   healthServer = startHealthServer();
 
   client.once("ready", async () => {
-    log("discord_ready", { botId: client.user.id });
+    const botUser = client.user;
+    const application = client.application;
+    if (!botUser || !application) throw new Error("Discord client was ready without its user or application.");
+    log("discord_ready", { botId: botUser.id });
     const recoveredRuns = database.recoverInterruptedScheduleOccurrences();
     if (recoveredRuns > 0) log("schedule_runs_recovered", { count: recoveredRuns });
     schedulePollTimer = setInterval(pollSchedules, 15_000);
     schedulePollTimer.unref?.();
     pollSchedules();
     try {
-      await client.application.commands.create(
+      await application.commands.create(
         new SlashCommandBuilder()
           .setName("login")
           .setDescription("Codex 계정을 이 봇에 로그인합니다.")
           .toJSON(),
         config.allowedGuildId,
       );
-      await client.application.commands.create(
+      await application.commands.create(
         new SlashCommandBuilder()
           .setName("mcp-login")
           .setDescription("MCP 서버에 OAuth 로그인합니다.")
@@ -2165,7 +2383,7 @@ async function main() {
           .toJSON(),
         config.allowedGuildId,
       );
-      await client.application.commands.create(
+      await application.commands.create(
         new SlashCommandBuilder()
           .setName("qna")
           .setDescription("최근 대화를 바탕으로 답변하는 Q&A 스레드를 엽니다.")
@@ -2187,45 +2405,45 @@ async function main() {
       log("message_handler_failed", {
         messageId: message.id,
         channelId: message.channelId,
-        diagnostic: describeCodexError(error),
+        diagnostic: describeCodexError(error instanceof Error ? error : String(error)),
       });
     });
   });
   client.on("interactionCreate", (interaction) => {
     if (interaction.isChatInputCommand() && interaction.commandName === "qna") {
       void handleQnaCommand(interaction).catch((error) => {
-        log("qna_interaction_failed", { diagnostic: describeCodexError(error) });
+        log("qna_interaction_failed", { diagnostic: describeCodexError(error instanceof Error ? error : String(error)) });
       });
       return;
     }
 
     if (interaction.isChatInputCommand() && interaction.commandName === "mcp-login") {
       void handleMcpLoginCommand(interaction).catch((error) => {
-        log("mcp_login_interaction_failed", { diagnostic: describeCodexError(error) });
+        log("mcp_login_interaction_failed", { diagnostic: describeCodexError(error instanceof Error ? error : String(error)) });
       });
       return;
     }
 
     if (interaction.isButton() && interaction.customId.startsWith("mcp_login_")) {
       void handleMcpLoginButton(interaction).catch((error) => {
-        log("mcp_login_button_failed", { diagnostic: describeCodexError(error) });
+        log("mcp_login_button_failed", { diagnostic: describeCodexError(error instanceof Error ? error : String(error)) });
       });
       return;
     }
 
     if (interaction.isModalSubmit() && interaction.customId.startsWith("mcp_login_callback:")) {
       void handleMcpLoginCallback(interaction).catch((error) => {
-        log("mcp_login_callback_failed", { diagnostic: describeCodexError(error) });
+        log("mcp_login_callback_failed", { diagnostic: describeCodexError(error instanceof Error ? error : String(error)) });
       });
       return;
     }
 
     void handleLoginCommand(interaction).catch((error) => {
-      log("login_interaction_failed", { diagnostic: describeCodexError(error) });
+      log("login_interaction_failed", { diagnostic: describeCodexError(error instanceof Error ? error : String(error)) });
     });
   });
 
-  const shutdown = async (signal) => {
+  const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
     log("shutdown_started", { signal });
@@ -2237,7 +2455,7 @@ async function main() {
     }
     if (schedulePollTimer) clearInterval(schedulePollTimer);
     client.destroy();
-    healthServer.close();
+    healthServer?.close();
 
     const timeout = new Promise((resolve) => setTimeout(resolve, 55_000));
     await Promise.race([queueTail, timeout]);
@@ -2257,7 +2475,7 @@ async function main() {
 }
 
 void main().catch((error) => {
-  log("startup_failed", { diagnostic: describeCodexError(error) });
+  log("startup_failed", { diagnostic: describeCodexError(error instanceof Error ? error : String(error)) });
   client.destroy();
   database.close();
   healthServer?.close();

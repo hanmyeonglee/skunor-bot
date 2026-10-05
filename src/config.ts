@@ -1,7 +1,7 @@
 const DEFAULT_EXCEED_MESSAGE =
   "현재 Codex 사용 한도에 도달했습니다. 사용량이 복구된 뒤 `@봇 재확인`으로 다시 확인해 주세요.";
 
-function requiredEnv(name) {
+function requiredEnv(name: string): string {
   const value = process.env[name]?.trim();
   if (!value) {
     throw new Error(`Missing required environment variable: ${name}`);
@@ -9,7 +9,7 @@ function requiredEnv(name) {
   return value;
 }
 
-function positiveInteger(name, defaultValue) {
+function positiveInteger(name: string, defaultValue: number): number {
   const value = Number.parseInt(process.env[name] ?? String(defaultValue), 10);
   if (!Number.isInteger(value) || value < 1 || value > 65535) {
     throw new Error(`Invalid ${name}: expected a TCP port number`);
