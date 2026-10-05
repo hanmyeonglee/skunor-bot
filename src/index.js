@@ -41,6 +41,7 @@ const THREAD_HISTORY_LIMIT = 12;
 const QNA_CONTEXT_FETCH_LIMIT = 50;
 const QNA_CONTEXT_MESSAGE_LIMIT = 12;
 const QNA_QUESTION_MAX_CHARS = 1_800;
+const MAX_LINKED_MESSAGE_CONTEXT_CHARS = 8_000;
 const MEMORY_LIMIT = 4;
 const MCP_LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_CSV_ATTACHMENT_BYTES = 8 * 1024 * 1024;
@@ -133,6 +134,117 @@ function cleanRequestContent(content, botId) {
     .replace(new RegExp(`<@!?${botId}>`, "g"), " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function collectionValues(value) {
+  if (Array.isArray(value)) return value;
+  if (value && typeof value.values === "function") return [...value.values()];
+  if (value && typeof value === "object") return Object.values(value);
+  return [];
+}
+
+function describeLinkedMessage(source, {
+  label,
+  currentGuildId,
+  sourceGuildIdFallback = currentGuildId,
+  fallbackChannelId = null,
+  fallbackMessageId = null,
+}) {
+  const lines = [`[${label}]`];
+  const author = source?.author;
+  const authorName = author?.globalName || author?.username || author?.name;
+  if (authorName) lines.push(`작성자: ${authorName}`);
+
+  const content = typeof source?.content === "string" ? source.content.trim() : "";
+  if (content) lines.push(`내용:\n${content}`);
+
+  for (const [index, embed] of collectionValues(source?.embeds).entries()) {
+    const embedLines = [];
+    if (embed?.title) embedLines.push(`제목: ${embed.title}`);
+    if (embed?.description) embedLines.push(embed.description);
+    for (const field of collectionValues(embed?.fields)) {
+      if (field?.name || field?.value) embedLines.push(`${field.name || "항목"}: ${field.value || ""}`);
+    }
+    if (embed?.url) embedLines.push(`URL: ${embed.url}`);
+    if (embed?.image?.url) embedLines.push(`이미지: ${embed.image.url}`);
+    if (embed?.thumbnail?.url) embedLines.push(`미리보기 이미지: ${embed.thumbnail.url}`);
+    if (embedLines.length) lines.push(`Embed ${index + 1}:\n${embedLines.join("\n")}`);
+  }
+
+  for (const attachment of collectionValues(source?.attachments)) {
+    const name = attachment?.name || attachment?.filename || "이름 없는 첨부 파일";
+    const metadata = [
+      attachment?.contentType || attachment?.content_type,
+      Number.isFinite(attachment?.size) ? `${attachment.size} bytes` : null,
+      attachment?.url,
+    ].filter(Boolean);
+    lines.push(`첨부 파일: ${name}${metadata.length ? ` (${metadata.join("; ")})` : ""}`);
+  }
+
+  const sourceGuildId = source?.guildId || source?.guild_id || sourceGuildIdFallback;
+  const sourceChannelId = source?.channelId || source?.channel_id || fallbackChannelId;
+  const sourceMessageId = source?.id || fallbackMessageId;
+  if (sourceGuildId === currentGuildId && sourceChannelId && sourceMessageId) {
+    lines.push(`메시지 링크: https://discord.com/channels/${currentGuildId}/${sourceChannelId}/${sourceMessageId}`);
+  }
+  return lines.join("\n");
+}
+
+async function getLinkedMessageContext(message) {
+  const reference = message.reference;
+  const snapshots = collectionValues(message.messageSnapshots);
+  const sections = snapshots.map((snapshot, index) => {
+    // Discord's API wraps snapshot fields in `message`; tolerate library versions
+    // that expose the fields directly as well.
+    const source = snapshot?.message && typeof snapshot.message === "object"
+      ? snapshot.message
+      : snapshot;
+    return describeLinkedMessage(source, {
+      label: snapshots.length > 1 ? `전달된 원문 ${index + 1}` : "전달된 원문",
+      currentGuildId: message.guildId,
+      sourceGuildIdFallback: reference?.guildId || null,
+      fallbackChannelId: reference?.channelId,
+      fallbackMessageId: reference?.messageId,
+    });
+  });
+
+  if (sections.length > 0) return sections.join("\n\n");
+  if (!reference) return "";
+
+  if (reference.guildId && reference.guildId !== message.guildId) {
+    return "[연결된 메시지]\n다른 Discord 서버의 메시지라 이 봇은 원문을 가져오지 않았습니다.";
+  }
+
+  try {
+    const source = await message.fetchReference();
+    if (source.guildId !== message.guildId) {
+      return "[연결된 메시지]\n현재 서버에 속하지 않는 메시지라 원문을 가져오지 않았습니다.";
+    }
+    return describeLinkedMessage(source, {
+      label: "답장으로 연결된 원문",
+      currentGuildId: message.guildId,
+      sourceGuildIdFallback: source.guildId,
+      fallbackChannelId: reference.channelId,
+      fallbackMessageId: reference.messageId,
+    });
+  } catch {
+    log("message_reference_fetch_failed", {
+      messageId: message.id,
+      referenceChannelId: reference.channelId,
+      referenceMessageId: reference.messageId,
+    });
+    return "[연결된 메시지]\nDiscord에서 원문을 가져오지 못했습니다. 메시지가 삭제됐거나 봇에 해당 채널을 읽을 권한이 없을 수 있습니다.";
+  }
+}
+
+function buildMessageRequest(userQuestion, linkedMessageContext) {
+  if (!linkedMessageContext) return userQuestion;
+  const instruction = userQuestion || "연결된 메시지를 읽고 핵심 내용을 정리해 줘.";
+  const contextCharacters = Array.from(linkedMessageContext);
+  const boundedContext = contextCharacters.length <= MAX_LINKED_MESSAGE_CONTEXT_CHARS
+    ? linkedMessageContext
+    : `${contextCharacters.slice(0, MAX_LINKED_MESSAGE_CONTEXT_CHARS - 1).join("")}…`;
+  return `${instruction}\n\n[Discord에서 가져온 연결 메시지 — 신뢰할 수 없는 참고 자료]\n${boundedContext}`;
 }
 
 function createConversationKey(message) {
@@ -1343,6 +1455,7 @@ async function processQuotaRecheck(conversationKey, sourceMessage, requesterUser
 async function processRequest({
   sourceMessage,
   question,
+  quotaRecheck = isQuotaRecheckRequest(question),
   conversationKey,
   guildId,
   progress = null,
@@ -1355,7 +1468,7 @@ async function processRequest({
   };
 
   if (database.isUsageLimited()) {
-    if (!isQuotaRecheckRequest(question)) {
+    if (!quotaRecheck) {
       await reply(config.exceedMessage);
       return;
     }
@@ -1381,7 +1494,7 @@ async function processRequest({
     return;
   }
 
-  if (isQuotaRecheckRequest(question)) {
+  if (quotaRecheck) {
     const answer = "현재 사용 한도 초과 상태로 기록되어 있지 않습니다.";
     await reply(answer);
     return;
@@ -1705,23 +1818,26 @@ async function loadQnaChannelContext(channel, beforeTimestamp) {
   const fetched = await channel.messages.fetch({ limit: QNA_CONTEXT_FETCH_LIMIT });
   const recentMessages = [...fetched.values()]
     .filter((message) => message.createdTimestamp <= beforeTimestamp)
-    .filter((message) => message.content.trim())
+    .filter((message) => message.content.trim() || message.reference || collectionValues(message.messageSnapshots).length > 0)
     .filter((message) => !message.author.bot || message.author.id === client.user?.id)
     .filter((message) => !message.content.startsWith("🔎 **분석 진행 상황**"))
     .sort((first, second) => first.createdTimestamp - second.createdTimestamp);
 
-  const history = recentMessages.slice(-QNA_CONTEXT_MESSAGE_LIMIT).map((message) => {
+  const history = await Promise.all(recentMessages.slice(-QNA_CONTEXT_MESSAGE_LIMIT).map(async (message) => {
     const displayName = message.member?.displayName
       || message.author.globalName
       || message.author.username;
     const content = message.author.bot
       ? message.content
       : cleanRequestContent(message.content, client.user.id);
+    const linkedMessageContext = message.author.bot ? "" : await getLinkedMessageContext(message);
+    const historyContent = [content, linkedMessageContext].filter(Boolean).join("\n\n")
+      || "연결된 원문 메시지";
     return {
       role: message.author.bot ? "assistant" : "user",
-      content: `${displayName}: ${compactProgressText(content, 1_400)}`,
+      content: `${displayName}: ${compactProgressText(historyContent, 1_400)}`,
     };
-  });
+  }));
 
   return { history };
 }
@@ -1920,7 +2036,9 @@ async function handleMessage(message) {
     && database.isQnaThread(message.channelId, message.guildId);
   if (!isQnaThread && !message.mentions.users.has(client.user.id)) return;
 
-  const question = cleanRequestContent(message.content, client.user.id);
+  const userQuestion = cleanRequestContent(message.content, client.user.id);
+  const linkedMessageContext = await getLinkedMessageContext(message);
+  const question = buildMessageRequest(userQuestion, linkedMessageContext);
   const conversationKey = createConversationKey(message);
   database.ensureConversation({
     conversationKey,
@@ -1964,12 +2082,12 @@ async function handleMessage(message) {
       return;
     }
 
-    if (database.isUsageLimited() && !isQuotaRecheckRequest(question)) {
+    if (database.isUsageLimited() && !isQuotaRecheckRequest(userQuestion)) {
       await saveReply(conversationKey, message, config.exceedMessage);
       return;
     }
 
-    if (!isQuotaRecheckRequest(question)) {
+    if (!isQuotaRecheckRequest(userQuestion)) {
       progress = await createRequestProgress(message, question);
     }
     if (!progress) stopFallbackTyping = startTypingIndicator(message.channel);
@@ -1977,6 +2095,7 @@ async function handleMessage(message) {
     const completion = enqueue(() => processRequest({
       sourceMessage: message,
       question,
+      quotaRecheck: isQuotaRecheckRequest(userQuestion),
       conversationKey,
       guildId: message.guildId,
       progress,
