@@ -1,9 +1,11 @@
 import http from "node:http";
 import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
 import type { Server } from "node:http";
 import { CronExpressionParser } from "cron-parser";
-import type { Thread } from "@openai/codex-sdk";
+import type { Input, Thread } from "@openai/codex-sdk";
 import {
   ActionRowBuilder,
   AttachmentBuilder,
@@ -42,6 +44,7 @@ import {
   installBundledSkills,
   describeCodexError,
   MCP_OAUTH_SERVER_NAMES,
+  CODEX_WORKING_DIRECTORY,
   type CodexRequestOptions,
 } from "./codex.js";
 import type { DiscordContext, NotificationTarget, PromptHistoryEntry } from "./types.js";
@@ -61,6 +64,10 @@ const MAX_LINKED_MESSAGE_CONTEXT_CHARS = 8_000;
 const MEMORY_LIMIT = 4;
 const MCP_LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_CSV_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+const MAX_IMAGE_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+const MAX_IMAGE_ATTACHMENTS_PER_REQUEST = 5;
+const MAX_TOTAL_IMAGE_ATTACHMENT_BYTES = 40 * 1024 * 1024;
+const IMAGE_DOWNLOAD_TIMEOUT_MS = 30_000;
 const STRUCTURED_RESPONSE_PATTERN = /(?:^|\r?\n)\[\[SKUNOR_RESPONSE_V1\]\]\s*\r?\n([\s\S]*?)\r?\n\[\[\/SKUNOR_RESPONSE_V1\]\](?=\r?\n|$)/;
 
 type FenceState = { character: string; length: number; openingLine: string; closingLine: string };
@@ -90,6 +97,7 @@ type ProcessRequestOptions = {
   progress?: RequestProgress;
   requesterUserId?: string;
   initialHistory?: PromptHistoryEntry[];
+  imageAttachments?: DiscordAttachmentReference[];
 };
 type InitialQnaRequestOptions = {
   sourceMessage: Message;
@@ -98,6 +106,22 @@ type InitialQnaRequestOptions = {
   guildId: string;
   requesterUserId: string;
   initialHistory: PromptHistoryEntry[];
+  imageAttachments: DiscordAttachmentReference[];
+};
+type DiscordAttachmentReference = {
+  name: string;
+  contentType?: string;
+  size?: number;
+  url: string;
+};
+type LinkedMessageContext = {
+  text: string;
+  attachments: DiscordAttachmentReference[];
+};
+type DownloadedCodexImages = {
+  directory?: string;
+  files: Array<{ path: string; name: string; sourceUrl: string }>;
+  failedCount: number;
 };
 type LinkedMessageLike = {
   author?: { globalName?: string; username?: string; name?: string };
@@ -276,6 +300,30 @@ function collectionValues<T>(value: Iterable<T> | { values(): IterableIterator<T
   return [];
 }
 
+function collectAttachmentReferences(source: LinkedMessageLike): DiscordAttachmentReference[] {
+  return collectionValues(source.attachments).flatMap((attachment) => {
+    if (!attachment?.url) return [];
+    const size = typeof attachment.size === "number" && Number.isFinite(attachment.size)
+      ? attachment.size
+      : undefined;
+    return [{
+      name: attachment.name || attachment.filename || "이름 없는 첨부 파일",
+      contentType: attachment.contentType || attachment.content_type || undefined,
+      size,
+      url: attachment.url,
+    }];
+  });
+}
+
+function uniqueAttachments(attachments: readonly DiscordAttachmentReference[]): DiscordAttachmentReference[] {
+  const seen = new Set<string>();
+  return attachments.filter((attachment) => {
+    if (seen.has(attachment.url)) return false;
+    seen.add(attachment.url);
+    return true;
+  });
+}
+
 function describeLinkedMessage(source: LinkedMessageLike, {
   label,
   currentGuildId,
@@ -323,15 +371,17 @@ function describeLinkedMessage(source: LinkedMessageLike, {
   return lines.join("\n");
 }
 
-async function getLinkedMessageContext(message: Message): Promise<string> {
+async function getLinkedMessageContext(message: Message): Promise<LinkedMessageContext> {
   const reference = message.reference;
   const currentGuildId = message.guildId ?? "";
   const snapshots = [...message.messageSnapshots.values()];
+  const attachments: DiscordAttachmentReference[] = [];
   const sections = snapshots.map((snapshot, index) => {
     // Discord's API wraps snapshot fields in `message`; tolerate library versions
     // that expose the fields directly as well.
     const envelope = snapshot as MessageSnapshot & { message?: LinkedMessageLike };
     const source = envelope.message && typeof envelope.message === "object" ? envelope.message : snapshot;
+    attachments.push(...collectAttachmentReferences(source as LinkedMessageLike));
     return describeLinkedMessage(source as LinkedMessageLike, {
       label: snapshots.length > 1 ? `전달된 원문 ${index + 1}` : "전달된 원문",
       currentGuildId,
@@ -341,43 +391,244 @@ async function getLinkedMessageContext(message: Message): Promise<string> {
     });
   });
 
-  if (sections.length > 0) return sections.join("\n\n");
-  if (!reference) return "";
+  if (sections.length > 0) {
+    return { text: sections.join("\n\n"), attachments: uniqueAttachments(attachments) };
+  }
+  if (!reference) return { text: "", attachments: [] };
 
   if (reference.guildId && reference.guildId !== message.guildId) {
-    return "[연결된 메시지]\n다른 Discord 서버의 메시지라 이 봇은 원문을 가져오지 않았습니다.";
+    return {
+      text: "[연결된 메시지]\n다른 Discord 서버의 메시지라 이 봇은 원문을 가져오지 않았습니다.",
+      attachments: [],
+    };
   }
 
   try {
     const source = await message.fetchReference();
     if (source.guildId !== currentGuildId) {
-      return "[연결된 메시지]\n현재 서버에 속하지 않는 메시지라 원문을 가져오지 않았습니다.";
+      return {
+        text: "[연결된 메시지]\n현재 서버에 속하지 않는 메시지라 원문을 가져오지 않았습니다.",
+        attachments: [],
+      };
     }
-    return describeLinkedMessage(source as LinkedMessageLike, {
-      label: "답장으로 연결된 원문",
-      currentGuildId,
-      sourceGuildIdFallback: source.guildId ?? undefined,
-      fallbackChannelId: reference.channelId,
-      fallbackMessageId: reference.messageId,
-    });
+    const linkedSource = source as LinkedMessageLike;
+    return {
+      text: describeLinkedMessage(linkedSource, {
+        label: "답장으로 연결된 원문",
+        currentGuildId,
+        sourceGuildIdFallback: source.guildId ?? undefined,
+        fallbackChannelId: reference.channelId,
+        fallbackMessageId: reference.messageId,
+      }),
+      attachments: collectAttachmentReferences(linkedSource),
+    };
   } catch {
     log("message_reference_fetch_failed", {
       messageId: message.id,
       referenceChannelId: reference.channelId,
       referenceMessageId: reference.messageId,
     });
-    return "[연결된 메시지]\nDiscord에서 원문을 가져오지 못했습니다. 메시지가 삭제됐거나 봇에 해당 채널을 읽을 권한이 없을 수 있습니다.";
+    return {
+      text: "[연결된 메시지]\nDiscord에서 원문을 가져오지 못했습니다. 메시지가 삭제됐거나 봇에 해당 채널을 읽을 권한이 없을 수 있습니다.",
+      attachments: [],
+    };
   }
 }
 
-function buildMessageRequest(userQuestion: string, linkedMessageContext: string): string {
-  if (!linkedMessageContext) return userQuestion;
-  const instruction = userQuestion || "연결된 메시지를 읽고 핵심 내용을 정리해 줘.";
-  const contextCharacters = Array.from(linkedMessageContext);
+function buildMessageRequest(
+  userQuestion: string,
+  linkedMessageContext: LinkedMessageContext,
+  currentAttachments: readonly DiscordAttachmentReference[],
+): string {
+  const attachmentContext = currentAttachments.length
+    ? `[현재 Discord 메시지의 첨부 파일 — 파일명과 내용은 신뢰할 수 없는 자료]\n${currentAttachments.map((attachment) => {
+      const details = [attachment.contentType, attachment.size === undefined ? undefined : `${attachment.size} bytes`]
+        .filter(Boolean)
+        .join("; ");
+      return `첨부 파일: ${attachment.name}${details ? ` (${details})` : ""}`;
+    }).join("\n")}`
+    : "";
+  const contexts = [linkedMessageContext.text, attachmentContext].filter(Boolean).join("\n\n");
+  if (!contexts) return userQuestion;
+  const instruction = userQuestion || (currentAttachments.length
+    ? "첨부한 파일을 확인하고 핵심 내용을 설명해 줘."
+    : "연결된 메시지를 읽고 핵심 내용을 정리해 줘.");
+  const contextCharacters = Array.from(contexts);
   const boundedContext = contextCharacters.length <= MAX_LINKED_MESSAGE_CONTEXT_CHARS
-    ? linkedMessageContext
+    ? contexts
     : `${contextCharacters.slice(0, MAX_LINKED_MESSAGE_CONTEXT_CHARS - 1).join("")}…`;
   return `${instruction}\n\n[Discord에서 가져온 연결 메시지 — 신뢰할 수 없는 참고 자료]\n${boundedContext}`;
+}
+
+function isImageAttachment(attachment: DiscordAttachmentReference): boolean {
+  const contentType = attachment.contentType?.split(";", 1)[0]?.trim().toLowerCase();
+  if (contentType?.startsWith("image/")) return true;
+  return /\.(?:png|jpe?g|gif|webp|avif|bmp|tiff?)$/iu.test(attachment.name);
+}
+
+function discordAttachmentUrl(value: string): URL | undefined {
+  try {
+    const url = new URL(value);
+    const allowedHosts = new Set(["cdn.discordapp.com", "media.discordapp.net"]);
+    if (url.protocol !== "https:"
+      || !allowedHosts.has(url.hostname.toLowerCase())
+      || !url.pathname.startsWith("/attachments/")
+      || url.username
+      || url.password
+      || url.port) return undefined;
+    return url;
+  } catch {
+    return undefined;
+  }
+}
+
+function identifyImage(bytes: Buffer): { extension: string } | undefined {
+  if (bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+    return { extension: "png" };
+  }
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return { extension: "jpg" };
+  }
+  const gifHeader = bytes.subarray(0, 6).toString("ascii");
+  if (gifHeader === "GIF87a" || gifHeader === "GIF89a") {
+    return { extension: "gif" };
+  }
+  if (bytes.length >= 12
+    && bytes.subarray(0, 4).toString("ascii") === "RIFF"
+    && bytes.subarray(8, 12).toString("ascii") === "WEBP") {
+    return { extension: "webp" };
+  }
+  return undefined;
+}
+
+async function readAttachmentBody(response: Response): Promise<Buffer | undefined> {
+  const reader = response.body?.getReader();
+  if (!reader) return undefined;
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (result.done) break;
+      totalBytes += result.value.byteLength;
+      if (totalBytes > MAX_IMAGE_ATTACHMENT_BYTES) {
+        await reader.cancel();
+        return undefined;
+      }
+      chunks.push(Buffer.from(result.value));
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks, totalBytes);
+}
+
+async function downloadCodexImages(
+  attachments: readonly DiscordAttachmentReference[],
+  progress?: RequestProgress,
+): Promise<DownloadedCodexImages> {
+  const candidates = uniqueAttachments(attachments).filter(isImageAttachment);
+  if (candidates.length === 0) return { files: [], failedCount: 0 };
+
+  const selected = candidates.slice(0, MAX_IMAGE_ATTACHMENTS_PER_REQUEST);
+  let failedCount = candidates.length - selected.length;
+  let directory: string;
+  try {
+    directory = await fs.mkdtemp(path.join(CODEX_WORKING_DIRECTORY, "skunor-images-"));
+  } catch (error) {
+    log("request_image_attachment_unavailable", {
+      reason: "temporary_directory_unavailable",
+      count: candidates.length,
+      diagnostic: describeCodexError(error instanceof Error ? error : String(error)),
+    });
+    return { files: [], failedCount: candidates.length };
+  }
+
+  const files: DownloadedCodexImages["files"] = [];
+  let totalBytes = 0;
+  for (const attachment of selected) {
+    if ((attachment.size ?? 0) > MAX_IMAGE_ATTACHMENT_BYTES) {
+      failedCount += 1;
+      continue;
+    }
+    const url = discordAttachmentUrl(attachment.url);
+    if (!url) {
+      failedCount += 1;
+      continue;
+    }
+
+    try {
+      const response = await fetch(url, {
+        signal: AbortSignal.timeout(IMAGE_DOWNLOAD_TIMEOUT_MS),
+        redirect: "error",
+      });
+      if (!response.ok) {
+        failedCount += 1;
+        continue;
+      }
+      const contentLength = Number(response.headers.get("content-length"));
+      if (Number.isFinite(contentLength) && contentLength > MAX_IMAGE_ATTACHMENT_BYTES) {
+        failedCount += 1;
+        continue;
+      }
+      const bytes = await readAttachmentBody(response);
+      if (!bytes || bytes.length === 0 || totalBytes + bytes.length > MAX_TOTAL_IMAGE_ATTACHMENT_BYTES) {
+        failedCount += 1;
+        continue;
+      }
+      const image = identifyImage(bytes);
+      if (!image) {
+        failedCount += 1;
+        continue;
+      }
+      const imagePath = path.join(directory, `image-${files.length + 1}.${image.extension}`);
+      await fs.writeFile(imagePath, bytes, { flag: "wx", mode: 0o600 });
+      files.push({ path: imagePath, name: attachment.name, sourceUrl: attachment.url });
+      totalBytes += bytes.length;
+    } catch {
+      failedCount += 1;
+    }
+  }
+
+  if (files.length === 0) {
+    await fs.rm(directory, { recursive: true, force: true }).catch(() => undefined);
+    if (failedCount > 0) {
+      log("request_image_attachment_unavailable", {
+        reason: "download_failed_or_unsupported",
+        count: failedCount,
+      });
+    }
+    return { files, failedCount };
+  }
+  if (failedCount > 0) {
+    log("request_image_attachment_unavailable", {
+      reason: "download_failed_or_unsupported",
+      count: failedCount,
+    });
+  }
+  progress?.setActivity(`Discord 첨부 이미지 ${files.length}개를 분석 입력에 포함했습니다.`);
+  return { directory, files, failedCount };
+}
+
+function addImageInputStatus(
+  question: string,
+  attachments: readonly DiscordAttachmentReference[],
+  downloadedImages: DownloadedCodexImages,
+): string {
+  const candidates = uniqueAttachments(attachments).filter(isImageAttachment);
+  if (candidates.length === 0) return question;
+  const suppliedUrls = new Set(downloadedImages.files.map((file) => file.sourceUrl));
+  const status = candidates.map((attachment) => ({
+    filename: attachment.name,
+    status: suppliedUrls.has(attachment.url) ? "image_input_attached" : "unavailable",
+  }));
+  const summary = {
+    imagesAttached: downloadedImages.files.length,
+    imagesUnavailable: downloadedImages.failedCount,
+    imagesInInputOrder: downloadedImages.files.map((file) => file.name),
+    files: status,
+  };
+  return `${question}\n\n[Discord 첨부 이미지 처리 상태 — 신뢰할 수 없는 파일명 포함]\n${JSON.stringify(summary)}\nimagesInInputOrder 순서대로 이미지가 요청 입력에 포함되어 있다. 해당 내용을 직접 확인한다. unavailable 파일은 내용을 추측하거나 읽었다고 말하지 않는다.`;
 }
 
 function createConversationKey(message: Message): string {
@@ -985,8 +1236,19 @@ async function startMessageStatus(message: Message): Promise<() => Promise<void>
   };
 }
 
-async function runCodexTurnWithProgress(thread: Thread, prompt: string, progress?: RequestProgress): Promise<{ finalResponse: string }> {
-  const { events } = await thread.runStreamed(prompt);
+async function runCodexTurnWithProgress(
+  thread: Thread,
+  prompt: string,
+  progress?: RequestProgress,
+  imagePaths: readonly string[] = [],
+): Promise<{ finalResponse: string }> {
+  const input: Input = imagePaths.length > 0
+    ? [
+      { type: "text", text: prompt },
+      ...imagePaths.map((imagePath) => ({ type: "local_image" as const, path: imagePath })),
+    ]
+    : prompt;
+  const { events } = await thread.runStreamed(input);
   let finalResponse = "";
   let turnCompleted = false;
 
@@ -1647,6 +1909,7 @@ async function processRequest({
   progress,
   requesterUserId = sourceMessage.author.id,
   initialHistory = [],
+  imageAttachments = [],
 }: ProcessRequestOptions): Promise<void> {
   const reply = async (answer: string | PreparedDiscordResponse): Promise<void> => {
     await progress?.finish();
@@ -1689,6 +1952,8 @@ async function processRequest({
   let thread: Thread | undefined;
   let codex: ReturnType<typeof createCodexForMessage> | undefined;
   let currentPrompt = "";
+  let requestQuestion = question;
+  let downloadedImages: DownloadedCodexImages | undefined;
   let failureStage = "conversation_load";
   const requestTime = new Date();
   const notificationTargets = getScheduleNotificationTargets(sourceMessage);
@@ -1708,6 +1973,10 @@ async function processRequest({
     }).format(requestTime),
   };
   try {
+    failureStage = "attachment_download";
+    downloadedImages = await downloadCodexImages(imageAttachments, progress);
+    requestQuestion = addImageInputStatus(question, imageAttachments, downloadedImages);
+
     codex = createCodexForMessage(sourceMessage, { requesterUserId, notificationTargets });
     const conversation = database.getConversation(conversationKey);
     if (!conversation) throw new Error("The Discord conversation could not be loaded.");
@@ -1719,7 +1988,7 @@ async function processRequest({
       : codex.startThread(codexThreadOptions);
 
     currentPrompt = buildCodexPrompt({
-      question,
+      question: requestQuestion,
       history: conversation.codex_thread_id
         ? []
         : [...initialHistory, ...database.getRecentHistory(conversationKey, sourceMessage.id, THREAD_HISTORY_LIMIT)]
@@ -1728,7 +1997,8 @@ async function processRequest({
       discordContext,
     });
     failureStage = "thread_run";
-    const turn = await runCodexTurnWithProgress(thread, currentPrompt, progress);
+    const imagePaths = downloadedImages.files.map((file) => file.path);
+    const turn = await runCodexTurnWithProgress(thread, currentPrompt, progress, imagePaths);
 
     const answer = prepareDiscordResponse(turn.finalResponse?.trim() || "요청을 처리했지만 답변 텍스트가 비어 있습니다.");
 
@@ -1763,14 +2033,19 @@ async function processRequest({
         const replacementThreadId = replacementThread.id;
         if (!replacementThreadId) throw new Error("Codex did not return a thread identifier.");
         currentPrompt = buildCodexPrompt({
-          question,
+          question: requestQuestion,
           history: [...initialHistory, ...database.getRecentHistory(conversationKey, sourceMessage.id, THREAD_HISTORY_LIMIT)]
             .slice(-THREAD_HISTORY_LIMIT),
           memory: database.findRelevantMemory(guildId, question, MEMORY_LIMIT),
           discordContext,
         });
         progress?.setActivity("이전 Codex 대화를 복구하지 못해 현재 요청을 새 문맥에서 다시 조사하고 있습니다.");
-        const turn = await runCodexTurnWithProgress(replacementThread, currentPrompt, progress);
+        const turn = await runCodexTurnWithProgress(
+          replacementThread,
+          currentPrompt,
+          progress,
+          downloadedImages?.files.map((file) => file.path) ?? [],
+        );
         const answer = prepareDiscordResponse(turn.finalResponse?.trim() || "요청을 처리했지만 답변 텍스트가 비어 있습니다.");
         database.setCodexThreadId(conversationKey, replacementThreadId);
         database.saveResearchMemory({ guildId, conversationKey, question, answer: answer.historyText });
@@ -1805,6 +2080,14 @@ async function processRequest({
         redactValues: [question, currentPrompt, config.discordToken],
       }),
     });
+  } finally {
+    if (downloadedImages?.directory) {
+      await fs.rm(downloadedImages.directory, { recursive: true, force: true }).catch((error: Error) => {
+        log("request_image_cleanup_failed", {
+          diagnostic: describeCodexError(error),
+        });
+      });
+    }
   }
 }
 
@@ -2022,9 +2305,9 @@ function pollSchedules() {
 async function loadQnaChannelContext(
   channel: GuildTextBasedChannel,
   beforeTimestamp: number,
-): Promise<{ history: PromptHistoryEntry[] }> {
+): Promise<{ history: PromptHistoryEntry[]; imageAttachments: DiscordAttachmentReference[] }> {
   const botUser = client.user;
-  if (!botUser) return { history: [] };
+  if (!botUser) return { history: [], imageAttachments: [] };
   const fetched = await channel.messages.fetch({ limit: QNA_CONTEXT_FETCH_LIMIT });
   const recentMessages = [...fetched.values()]
     .filter((message) => message.createdTimestamp <= beforeTimestamp)
@@ -2033,23 +2316,44 @@ async function loadQnaChannelContext(
     .filter((message) => !message.content.startsWith("🔎 **분석 진행 상황**"))
     .sort((first, second) => first.createdTimestamp - second.createdTimestamp);
 
-  const history = await Promise.all(recentMessages.slice(-QNA_CONTEXT_MESSAGE_LIMIT).map(async (message) => {
+  const contextEntries = await Promise.all(recentMessages.slice(-QNA_CONTEXT_MESSAGE_LIMIT).map(async (message) => {
     const displayName = message.member?.displayName
       || message.author.globalName
       || message.author.username;
     const content = message.author.bot
       ? message.content
       : cleanRequestContent(message.content, botUser.id);
-    const linkedMessageContext = message.author.bot ? "" : await getLinkedMessageContext(message);
-    const historyContent = [content, linkedMessageContext].filter(Boolean).join("\n\n")
+    const linkedMessageContext = message.author.bot ? { text: "", attachments: [] } : await getLinkedMessageContext(message);
+    const messageAttachments: DiscordAttachmentReference[] = message.author.bot
+      ? []
+      : [...message.attachments.values()].map((attachment) => ({
+        name: attachment.name,
+        contentType: attachment.contentType || undefined,
+        size: attachment.size,
+        url: attachment.url,
+      }));
+    const attachments = [...messageAttachments, ...linkedMessageContext.attachments];
+    const attachmentSummary = messageAttachments.map((attachment) => {
+      const details = [attachment.contentType, attachment.size === undefined ? undefined : `${attachment.size} bytes`]
+        .filter(Boolean)
+        .join("; ");
+      return `첨부 파일: ${attachment.name}${details ? ` (${details})` : ""}`;
+    }).join("\n");
+    const historyContent = [content, linkedMessageContext.text, attachmentSummary].filter(Boolean).join("\n\n")
       || "연결된 원문 메시지";
     return {
-      role: message.author.bot ? "assistant" as const : "user" as const,
-      content: `${displayName}: ${compactProgressText(historyContent, 1_400)}`,
+      history: {
+        role: message.author.bot ? "assistant" as const : "user" as const,
+        content: `${displayName}: ${compactProgressText(historyContent, 1_400)}`,
+      },
+      attachments,
     };
   }));
 
-  return { history };
+  return {
+    history: contextEntries.map((entry) => entry.history),
+    imageAttachments: uniqueAttachments(contextEntries.flatMap((entry) => entry.attachments)),
+  };
 }
 
 async function processInitialQnaRequest({
@@ -2059,6 +2363,7 @@ async function processInitialQnaRequest({
   guildId,
   requesterUserId,
   initialHistory,
+  imageAttachments,
 }: InitialQnaRequestOptions): Promise<void> {
   let progress: RequestProgress | undefined;
   let stopFallbackTyping: (() => void) | undefined;
@@ -2095,6 +2400,7 @@ async function processInitialQnaRequest({
       guildId,
       requesterUserId,
       initialHistory,
+      imageAttachments,
       progress,
     });
   } finally {
@@ -2150,7 +2456,7 @@ async function handleQnaCommand(interaction: Interaction): Promise<void> {
 
   let thread: AnyThreadChannel | undefined;
   try {
-    const { history } = await loadQnaChannelContext(
+    const { history, imageAttachments } = await loadQnaChannelContext(
       qnaChannel as GuildTextBasedChannel,
       interaction.createdTimestamp,
     );
@@ -2203,6 +2509,7 @@ async function handleQnaCommand(interaction: Interaction): Promise<void> {
       guildId,
       requesterUserId: interaction.user.id,
       initialHistory: [],
+      imageAttachments,
     }));
     void completion.catch((error) => {
       log("qna_request_failed", {
@@ -2257,7 +2564,14 @@ async function handleMessage(message: Message): Promise<void> {
 
   const userQuestion = cleanRequestContent(message.content, client.user.id);
   const linkedMessageContext = await getLinkedMessageContext(message);
-  const question = buildMessageRequest(userQuestion, linkedMessageContext);
+  const currentAttachments: DiscordAttachmentReference[] = [...message.attachments.values()].map((attachment) => ({
+    name: attachment.name,
+    contentType: attachment.contentType || undefined,
+    size: attachment.size,
+    url: attachment.url,
+  }));
+  const imageAttachments = uniqueAttachments([...currentAttachments, ...linkedMessageContext.attachments]);
+  const question = buildMessageRequest(userQuestion, linkedMessageContext, currentAttachments);
   const conversationKey = createConversationKey(message);
   database.ensureConversation({
     conversationKey,
@@ -2318,6 +2632,7 @@ async function handleMessage(message: Message): Promise<void> {
       conversationKey,
       guildId,
       progress,
+      imageAttachments,
     }));
     await completion;
   } finally {
