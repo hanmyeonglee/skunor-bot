@@ -99,3 +99,5 @@ npm start
 ```
 
 로컬 실행에서도 Codex CLI 로그인 상태와 `curl`, `jq`, `poppler-utils`가 필요하며 `CODEX_HOME`에 스킬을 설치하고 권한 프로필을 초기화합니다.
+
+`npm run typecheck`는 TypeScript 컴파일러로 `src`의 JavaScript·TypeScript 구문을 검사합니다. Docker 이미지 빌드에서도 이 검사를 통과해야 합니다. 기존 봇 코드는 JavaScript로 실행되며, 컴파일러는 이미지 생성 전에 제거됩니다.
