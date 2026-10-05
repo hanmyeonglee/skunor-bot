@@ -26,7 +26,7 @@ import {
   createCodexClient,
   createThreadOptions,
   ensureCodexHomeConfig,
-  installDiscordApiSkill,
+  installBundledSkills,
   describeCodexError,
   MCP_OAUTH_SERVER_NAMES,
 } from "./codex.js";
@@ -48,7 +48,7 @@ const STRUCTURED_RESPONSE_PATTERN = /(?:^|\r?\n)\[\[SKUNOR_RESPONSE_V1\]\]\s*\r?
 
 const config = loadConfig();
 ensureCodexHomeConfig(config.codexHome);
-installDiscordApiSkill(config.codexHome);
+installBundledSkills(config.codexHome);
 const database = new BotDatabase(config.databasePath);
 const codexThreadOptions = createThreadOptions();
 const client = new Client({

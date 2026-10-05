@@ -22,7 +22,7 @@ ENV NODE_ENV=production \
 WORKDIR /app
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates curl jq \
+  && apt-get install -y --no-install-recommends ca-certificates curl jq poppler-utils \
   && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /data /workspace \
