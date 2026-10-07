@@ -1,6 +1,7 @@
 import http from "node:http";
 import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Server } from "node:http";
@@ -64,6 +65,9 @@ const MAX_LINKED_MESSAGE_CONTEXT_CHARS = 8_000;
 const MEMORY_LIMIT = 4;
 const MCP_LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_CSV_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+const MAX_GENERATED_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_GENERATED_FILES_PER_REQUEST = 5;
+const MAX_TOTAL_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_IMAGE_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_IMAGE_ATTACHMENTS_PER_REQUEST = 5;
 const MAX_TOTAL_IMAGE_ATTACHMENT_BYTES = 40 * 1024 * 1024;
@@ -74,12 +78,16 @@ type FenceState = { character: string; length: number; openingLine: string; clos
 type EmbedFieldData = { name: string; value: string; inline: boolean };
 type EmbedData = { title: string; description: string; fields: EmbedFieldData[] };
 type CsvData = { filename: string; content: string };
+type GeneratedFileData = { filename: string; content: Buffer };
+type DiscordOutputDirectory = { path: string; device: number; inode: number };
 type PreparedDiscordResponse = {
   kind: "prepared_discord_response";
   content: string;
   historyText: string;
   embed?: EmbedData;
   csv?: CsvData;
+  requestedFiles?: string[];
+  generatedFiles?: GeneratedFileData[];
 };
 type ProgressPlanItem = { text: string; completed: boolean };
 type RequestProgress = {
@@ -813,6 +821,43 @@ function sanitizeCsvFilename(filename: string | undefined): string {
   return safeFilename;
 }
 
+function sanitizeGeneratedFilename(filename: string): string | undefined {
+  if (!filename || filename !== filename.trim() || filename.length > 120
+    || filename === "." || filename === ".." || filename.startsWith(".")
+    || /[\\/\u0000-\u001f\u007f]/u.test(filename)) return undefined;
+  return filename;
+}
+
+async function createDiscordOutputDirectory(): Promise<DiscordOutputDirectory> {
+  const directoryPath = await fs.mkdtemp(path.join(CODEX_WORKING_DIRECTORY, "skunor-output-"));
+  try {
+    const stats = await fs.lstat(directoryPath);
+    if (!stats.isDirectory() || stats.isSymbolicLink()) {
+      throw new Error("The Discord output path is not a regular directory.");
+    }
+    return { path: directoryPath, device: stats.dev, inode: stats.ino };
+  } catch (error) {
+    await fs.rm(directoryPath, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function removeDiscordOutputDirectory(directory: DiscordOutputDirectory): Promise<void> {
+  try {
+    const stats = await fs.lstat(directory.path);
+    if (!stats.isDirectory() || stats.isSymbolicLink()
+      || stats.dev !== directory.device || stats.ino !== directory.inode) {
+      log("request_file_cleanup_skipped", { reason: "output_directory_changed" });
+      return;
+    }
+    await fs.rm(directory.path, { recursive: true, force: true });
+  } catch (error) {
+    log("request_file_cleanup_failed", {
+      diagnostic: describeCodexError(error instanceof Error ? error : String(error)),
+    });
+  }
+}
+
 function validateEmbedPayload(embed: StructuredValue | undefined): EmbedData | undefined {
   if (!embed || typeof embed !== "object" || Array.isArray(embed)) return undefined;
   const record = embed as StructuredObject;
@@ -846,7 +891,17 @@ function validateEmbedPayload(embed: StructuredValue | undefined): EmbedData | u
   return { title, description, fields };
 }
 
-function makePreparedDiscordResponse({ content, embed, csv }: { content: string; embed?: EmbedData; csv?: CsvData }): PreparedDiscordResponse {
+function makePreparedDiscordResponse({
+  content,
+  embed,
+  csv,
+  requestedFiles,
+}: {
+  content: string;
+  embed?: EmbedData;
+  csv?: CsvData;
+  requestedFiles?: string[];
+}): PreparedDiscordResponse {
   const boundedContent = boundAnswer(content || "");
   const embedText = embed ? flattenEmbedForHistory(embed) : "";
   const csvText = csv ? `CSV 첨부: ${csv.filename}` : "";
@@ -856,6 +911,7 @@ function makePreparedDiscordResponse({ content, embed, csv }: { content: string;
     content: boundedContent,
     ...(embed ? { embed } : {}),
     ...(csv ? { csv } : {}),
+    ...(requestedFiles && requestedFiles.length > 0 ? { requestedFiles } : {}),
     historyText,
   };
 }
@@ -888,8 +944,29 @@ function prepareDiscordResponse(answer: string | PreparedDiscordResponse): Prepa
   ].filter(Boolean).join("\n\n");
   const hasEmbed = Boolean(payloadObject.embed);
   const hasCsv = Boolean(payloadObject.csv);
+  const requestedFiles: string[] = [];
+  let fileWarning = "";
+  if (payloadObject.files !== undefined) {
+    if (!Array.isArray(payloadObject.files)) {
+      fileWarning = "파일 첨부 목록을 처리하지 못했습니다.";
+    } else {
+      for (const item of payloadObject.files) {
+        const safeFilename = typeof item === "string" ? sanitizeGeneratedFilename(item) : undefined;
+        if (safeFilename) {
+          if (!requestedFiles.includes(safeFilename)) requestedFiles.push(safeFilename);
+        } else {
+          fileWarning = "일부 파일명을 처리하지 못해 첨부하지 못했습니다.";
+        }
+      }
+      if (requestedFiles.length > MAX_GENERATED_FILES_PER_REQUEST) {
+        requestedFiles.length = MAX_GENERATED_FILES_PER_REQUEST;
+        fileWarning = "한 번에 첨부할 수 있는 파일은 최대 5개라 나머지는 제외했습니다.";
+      }
+    }
+  }
+  const boundedContent = [content, fileWarning].filter(Boolean).join("\n\n");
   if (hasEmbed && hasCsv) {
-    return plainDiscordResponse(`${content}\n\nEmbed와 CSV를 함께 표시할 수 없어 응답을 목록 형식으로 다시 요청해 주세요.`.trim());
+    return plainDiscordResponse(`${boundedContent}\n\nEmbed와 CSV를 함께 표시할 수 없어 응답을 목록 형식으로 다시 요청해 주세요.`.trim());
   }
 
   if (hasEmbed) {
@@ -904,25 +981,25 @@ function prepareDiscordResponse(answer: string | PreparedDiscordResponse): Prepa
           && typeof (field as StructuredObject).name === "string" && typeof (field as StructuredObject).value === "string"))
         .map((field) => `**${field.name}**\n${field.value}`);
       return plainDiscordResponse([
-        content,
+        boundedContent,
         typeof rawEmbed.title === "string" ? rawEmbed.title : undefined,
         typeof rawEmbed.description === "string" ? rawEmbed.description : undefined,
         ...fallbackRows,
         "Embed 제한을 넘어 표를 목록 형태로 바꾸었습니다.",
       ].filter(Boolean).join("\n\n"));
     }
-    return makePreparedDiscordResponse({ content, embed });
+    return makePreparedDiscordResponse({ content: boundedContent, embed, requestedFiles });
   }
 
   if (hasCsv) {
     const rawCsv = payloadObject.csv;
     if (!rawCsv || typeof rawCsv !== "object" || Array.isArray(rawCsv)) {
-      return plainDiscordResponse(`${content}\n\nCSV 첨부를 만들지 못했습니다.`.trim());
+      return plainDiscordResponse(`${boundedContent}\n\nCSV 첨부를 만들지 못했습니다.`.trim());
     }
     const csvObject = rawCsv as StructuredObject;
     const csvContentValue = csvObject.content;
     if (typeof csvContentValue !== "string" || !csvContentValue.trim()) {
-      return plainDiscordResponse(`${content}\n\nCSV 첨부를 만들지 못했습니다.`.trim());
+      return plainDiscordResponse(`${boundedContent}\n\nCSV 첨부를 만들지 못했습니다.`.trim());
     }
     const csvContent = csvContentValue;
     const csv = {
@@ -930,15 +1007,23 @@ function prepareDiscordResponse(answer: string | PreparedDiscordResponse): Prepa
       content: csvContent.replaceAll(config.discordToken, "[Discord bot token redacted]"),
     };
     if (Buffer.byteLength(csv.content, "utf8") > MAX_CSV_ATTACHMENT_BYTES) {
-      return plainDiscordResponse(`${content}\n\nCSV 파일이 8 MiB 제한을 넘어 첨부하지 못했습니다.`.trim());
+      return plainDiscordResponse(`${boundedContent}\n\nCSV 파일이 8 MiB 제한을 넘어 첨부하지 못했습니다.`.trim());
     }
     return makePreparedDiscordResponse({
-      content: content || "표 데이터는 CSV 파일로 첨부했습니다.",
+      content: boundedContent || "표 데이터는 CSV 파일로 첨부했습니다.",
       csv,
+      requestedFiles,
     });
   }
 
-  return plainDiscordResponse(content);
+  if (requestedFiles.length > 0) {
+    return makePreparedDiscordResponse({
+      content: boundedContent || "요청한 파일을 첨부했습니다.",
+      requestedFiles,
+    });
+  }
+
+  return plainDiscordResponse(boundedContent);
 }
 
 function toDiscordEmbed(embed: EmbedData): EmbedBuilder {
@@ -949,17 +1034,132 @@ function toDiscordEmbed(embed: EmbedData): EmbedBuilder {
   return builder;
 }
 
+async function attachRequestedFiles(
+  response: PreparedDiscordResponse,
+  outputDirectory: DiscordOutputDirectory | undefined,
+): Promise<PreparedDiscordResponse> {
+  const requestedFiles = response.requestedFiles ?? [];
+  if (requestedFiles.length === 0) return response;
+
+  const generatedFiles: GeneratedFileData[] = [];
+  const failedFiles: string[] = [];
+  let totalBytes = response.csv ? Buffer.byteLength(response.csv.content, "utf8") : 0;
+  for (const filename of requestedFiles) {
+    if (!outputDirectory) {
+      failedFiles.push(filename);
+      continue;
+    }
+
+    let fileHandle: Awaited<ReturnType<typeof fs.open>> | undefined;
+    try {
+      const directoryStats = await fs.lstat(outputDirectory.path);
+      if (!directoryStats.isDirectory() || directoryStats.isSymbolicLink()
+        || directoryStats.dev !== outputDirectory.device || directoryStats.ino !== outputDirectory.inode) {
+        failedFiles.push(filename);
+        continue;
+      }
+      const filePath = path.join(outputDirectory.path, filename);
+      fileHandle = await fs.open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+      const stats = await fileHandle.stat();
+      if (!stats.isFile() || stats.nlink !== 1 || stats.size > MAX_GENERATED_FILE_BYTES
+        || totalBytes + stats.size > MAX_TOTAL_ATTACHMENT_BYTES) {
+        failedFiles.push(filename);
+        continue;
+      }
+      const content = Buffer.alloc(stats.size);
+      let bytesRead = 0;
+      while (bytesRead < stats.size) {
+        const result = await fileHandle.read(content, bytesRead, stats.size - bytesRead, bytesRead);
+        if (result.bytesRead === 0) break;
+        bytesRead += result.bytesRead;
+      }
+      const finalStats = await fileHandle.stat();
+      if (bytesRead !== stats.size || !finalStats.isFile() || finalStats.nlink !== 1
+        || finalStats.size !== stats.size || content.length > MAX_GENERATED_FILE_BYTES
+        || totalBytes + content.length > MAX_TOTAL_ATTACHMENT_BYTES) {
+        failedFiles.push(filename);
+        continue;
+      }
+      generatedFiles.push({ filename, content });
+      totalBytes += content.length;
+    } catch {
+      failedFiles.push(filename);
+    } finally {
+      await fileHandle?.close().catch(() => undefined);
+    }
+  }
+
+  const failureNotice = failedFiles.length > 0
+    ? `요청한 파일 ${failedFiles.length}개를 첨부하지 못했습니다. 파일이 없거나 크기 제한을 넘었을 수 있습니다.`
+    : "";
+  const content = boundAnswer([response.content, failureNotice].filter(Boolean).join("\n\n"));
+  const embedText = response.embed ? flattenEmbedForHistory(response.embed) : "";
+  const csvText = response.csv ? `CSV 첨부: ${response.csv.filename}` : "";
+  const generatedFilesText = generatedFiles.map((file) => `파일 첨부: ${file.filename}`).join("\n");
+  const historyText = boundAnswer([content, embedText, csvText, generatedFilesText].filter(Boolean).join("\n\n"));
+  return {
+    ...response,
+    content,
+    historyText,
+    requestedFiles: [],
+    generatedFiles,
+  };
+}
+
 function responseSendOptions(response: PreparedDiscordResponse, content: string | undefined, allowedMentions: MessageMentionOptions): MessageCreateOptions {
   const options: MessageCreateOptions = { allowedMentions };
   if (!response.embed) options.flags = MessageFlags.SuppressEmbeds;
   if (content) options.content = content;
   if (response.embed) options.embeds = [toDiscordEmbed(response.embed)];
+  const files: AttachmentBuilder[] = [];
   if (response.csv) {
-    options.files = [new AttachmentBuilder(Buffer.from(response.csv.content, "utf8"), {
+    files.push(new AttachmentBuilder(Buffer.from(response.csv.content, "utf8"), {
       name: response.csv.filename,
-    })];
+    }));
   }
+  for (const file of response.generatedFiles ?? []) {
+    files.push(new AttachmentBuilder(file.content, { name: file.filename }));
+  }
+  if (files.length > 0) options.files = files;
   return options;
+}
+
+async function sendResponseWithFileFallback(
+  send: (options: MessageCreateOptions) => Promise<Message>,
+  response: PreparedDiscordResponse,
+  content: string | undefined,
+  allowedMentions: MessageMentionOptions,
+  context: { channelId: string; messageId?: string; scheduleId?: string },
+): Promise<boolean> {
+  try {
+    await send(responseSendOptions(response, content, allowedMentions));
+    return true;
+  } catch (error) {
+    if (!response.csv && !response.generatedFiles?.length) throw error;
+    log("discord_file_upload_failed", {
+      ...context,
+      diagnostic: describeCodexError(error instanceof Error ? error : String(error), {
+        redactValues: [config.discordToken],
+      }),
+    });
+    const warning = "Discord에 파일을 올리지 못했습니다. 봇의 Attach Files 권한과 파일 크기를 확인해 주세요.";
+    const fallbackOptions: MessageCreateOptions = {
+      content: [content, warning].filter(Boolean).join("\n\n"),
+      allowedMentions,
+    };
+    if (response.embed) fallbackOptions.embeds = [toDiscordEmbed(response.embed)];
+    else fallbackOptions.flags = MessageFlags.SuppressEmbeds;
+    await send(fallbackOptions);
+    return false;
+  }
+}
+
+function failedFileUploadHistory(response: PreparedDiscordResponse): string {
+  return boundAnswer([
+    response.content,
+    response.embed ? flattenEmbedForHistory(response.embed) : "",
+    "Discord 파일 첨부에 실패했습니다.",
+  ].filter(Boolean).join("\n\n"));
 }
 
 async function postAnswer(sourceMessage: Message, answer: string | PreparedDiscordResponse): Promise<string> {
@@ -968,14 +1168,18 @@ async function postAnswer(sourceMessage: Message, answer: string | PreparedDisco
     ? splitForDiscord(response.content, config.maxDiscordMessageChars)
     : [];
 
-  await sourceMessage.reply(responseSendOptions(
+  const fileUploadSucceeded = await sendResponseWithFileFallback(
+    (options) => sourceMessage.reply(options),
     response,
     chunks[0],
     { parse: [], repliedUser: false },
-  ));
+    { channelId: sourceMessage.channelId, messageId: sourceMessage.id },
+  );
 
   const sourceChannel = sourceMessage.channel;
-  if (!("send" in sourceChannel)) return response.historyText;
+  if (!("send" in sourceChannel)) {
+    return fileUploadSucceeded ? response.historyText : failedFileUploadHistory(response);
+  }
   for (const chunk of chunks.slice(1)) {
     await sourceChannel.send({
       content: chunk,
@@ -984,7 +1188,7 @@ async function postAnswer(sourceMessage: Message, answer: string | PreparedDisco
     });
   }
 
-  return response.historyText;
+  return fileUploadSucceeded ? response.historyText : failedFileUploadHistory(response);
 }
 
 function enqueue(job: CodexJob): Promise<void> {
@@ -1954,6 +2158,7 @@ async function processRequest({
   let currentPrompt = "";
   let requestQuestion = question;
   let downloadedImages: DownloadedCodexImages | undefined;
+  let outputDirectory: DiscordOutputDirectory | undefined;
   let failureStage = "conversation_load";
   const requestTime = new Date();
   const notificationTargets = getScheduleNotificationTargets(sourceMessage);
@@ -1976,6 +2181,15 @@ async function processRequest({
     failureStage = "attachment_download";
     downloadedImages = await downloadCodexImages(imageAttachments, progress);
     requestQuestion = addImageInputStatus(question, imageAttachments, downloadedImages);
+    try {
+      outputDirectory = await createDiscordOutputDirectory();
+    } catch (error) {
+      log("request_file_output_unavailable", {
+        messageId: sourceMessage.id,
+        channelId: sourceMessage.channelId,
+        diagnostic: describeCodexError(error instanceof Error ? error : String(error)),
+      });
+    }
 
     codex = createCodexForMessage(sourceMessage, { requesterUserId, notificationTargets });
     const conversation = database.getConversation(conversationKey);
@@ -1995,12 +2209,16 @@ async function processRequest({
           .slice(-THREAD_HISTORY_LIMIT),
       memory,
       discordContext,
+      fileOutputDirectory: outputDirectory?.path,
     });
     failureStage = "thread_run";
     const imagePaths = downloadedImages.files.map((file) => file.path);
     const turn = await runCodexTurnWithProgress(thread, currentPrompt, progress, imagePaths);
 
-    const answer = prepareDiscordResponse(turn.finalResponse?.trim() || "요청을 처리했지만 답변 텍스트가 비어 있습니다.");
+    const answer = await attachRequestedFiles(
+      prepareDiscordResponse(turn.finalResponse?.trim() || "요청을 처리했지만 답변 텍스트가 비어 있습니다."),
+      outputDirectory,
+    );
 
     failureStage = "database_save";
     const threadId = thread.id;
@@ -2038,6 +2256,7 @@ async function processRequest({
             .slice(-THREAD_HISTORY_LIMIT),
           memory: database.findRelevantMemory(guildId, question, MEMORY_LIMIT),
           discordContext,
+          fileOutputDirectory: outputDirectory?.path,
         });
         progress?.setActivity("이전 Codex 대화를 복구하지 못해 현재 요청을 새 문맥에서 다시 조사하고 있습니다.");
         const turn = await runCodexTurnWithProgress(
@@ -2046,7 +2265,10 @@ async function processRequest({
           progress,
           downloadedImages?.files.map((file) => file.path) ?? [],
         );
-        const answer = prepareDiscordResponse(turn.finalResponse?.trim() || "요청을 처리했지만 답변 텍스트가 비어 있습니다.");
+        const answer = await attachRequestedFiles(
+          prepareDiscordResponse(turn.finalResponse?.trim() || "요청을 처리했지만 답변 텍스트가 비어 있습니다."),
+          outputDirectory,
+        );
         database.setCodexThreadId(conversationKey, replacementThreadId);
         database.saveResearchMemory({ guildId, conversationKey, question, answer: answer.historyText });
         await reply(answer);
@@ -2088,6 +2310,7 @@ async function processRequest({
         });
       });
     }
+    if (outputDirectory) await removeDiscordOutputDirectory(outputDirectory);
   }
 }
 
@@ -2121,11 +2344,13 @@ async function sendScheduleNotification(
     ? splitForDiscord(response.content, config.maxDiscordMessageChars)
     : [];
   const firstContent = chunks.length > 0 ? `${mention}\n${chunks[0]}` : mention;
-  await channel.send(responseSendOptions(
+  const fileUploadSucceeded = await sendResponseWithFileFallback(
+    (options) => channel.send(options),
     response,
     firstContent,
     { parse: [], users: [mentionUserId] },
-  ));
+    { channelId: schedule.channel_id, scheduleId: "schedule_id" in schedule ? schedule.schedule_id : schedule.id },
+  );
 
   for (const chunk of chunks.slice(1)) {
     await channel.send({
@@ -2134,10 +2359,11 @@ async function sendScheduleNotification(
       flags: MessageFlags.SuppressEmbeds,
     });
   }
-  return response.historyText;
+  return fileUploadSucceeded ? response.historyText : failedFileUploadHistory(response);
 }
 
 async function executeScheduleOccurrence(occurrence: OccurrenceRow): Promise<void> {
+  let outputDirectory: DiscordOutputDirectory | undefined;
   try {
     if (occurrence.run_type === "event_reminder") {
       const eventAt = occurrence.event_at;
@@ -2183,6 +2409,14 @@ async function executeScheduleOccurrence(occurrence: OccurrenceRow): Promise<voi
     };
     const codex = createCodexForMessage(requestContext, { allowScheduleWrites: false });
     const thread = codex.startThread(codexThreadOptions);
+    try {
+      outputDirectory = await createDiscordOutputDirectory();
+    } catch (error) {
+      log("schedule_file_output_unavailable", {
+        scheduleId: occurrence.schedule_id,
+        diagnostic: describeCodexError(error instanceof Error ? error : String(error)),
+      });
+    }
     const runAt = new Date();
     const discordContext = {
       guildId: occurrence.guild_id,
@@ -2197,9 +2431,13 @@ async function executeScheduleOccurrence(occurrence: OccurrenceRow): Promise<voi
     const prompt = buildCodexPrompt({
       question: `예약된 반복 작업을 이번 회차에 수행하세요. 결과를 등록 채널에 전달할 수 있도록 완결된 답변으로 작성하세요.\n\n작업 이름: ${occurrence.title}\n\n요청 내용:\n${occurrence.task_prompt}`,
       discordContext,
+      fileOutputDirectory: outputDirectory?.path,
     });
     const turn = await thread.run(prompt);
-    const answer = prepareDiscordResponse(turn.finalResponse?.trim() || "예약 작업을 수행했지만 답변 텍스트가 비어 있습니다.");
+    const answer = await attachRequestedFiles(
+      prepareDiscordResponse(turn.finalResponse?.trim() || "예약 작업을 수행했지만 답변 텍스트가 비어 있습니다."),
+      outputDirectory,
+    );
     await sendScheduleNotification(occurrence, answer);
     database.finishScheduleOccurrence({ id: occurrence.id, status: "succeeded", result: answer.historyText });
     log("schedule_task_completed", { scheduleId: occurrence.schedule_id, channelId: occurrence.channel_id });
@@ -2233,6 +2471,8 @@ async function executeScheduleOccurrence(occurrence: OccurrenceRow): Promise<voi
       channelId: occurrence.channel_id,
       diagnostic: describeCodexError(error instanceof Error ? error : String(error), { redactValues: [config.discordToken] }),
     });
+  } finally {
+    if (outputDirectory) await removeDiscordOutputDirectory(outputDirectory);
   }
 }
 
